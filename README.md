@@ -108,6 +108,21 @@ Past that, cost is traded for quality through the `quality` control, which is de
 
 The tiers move grid resolution and Jacobi iterations first because that is where the measurement pointed; raymarch steps barely move until the lowest tier, since cutting them buys almost nothing here and costs banding. At `performance` the plume is visibly softer and loses its finest wisps, but it is still recognisably the same fire, and a 3 ms frame leaves room for a game to do everything else.
 
+## Immersive VR
+
+There's an **Enter VR** button on headsets that can run it, tested against Safari on visionOS.
+
+The requirement worth calling out is that the session has to be WebGPU-backed. The solver *is* compute shaders, so there is no WebGL path to fall back to, and until WebKit shipped the WebXR/WebGPU binding this could not have worked on the device at all. Two things follow, both easy to get wrong:
+
+- `renderer.xr.enabled` has to be set **before** `renderer.init()`, because that is when three requests the adapter and passes the flag through as `xrCompatible`. Set it afterwards and the device is already the wrong kind.
+- the session is requested with `webgpu` as a *required* feature, alongside `layers`, which three needs in order to install its `XRGPUBinding` projection layer.
+
+The button stays hidden where immersive VR isn't offered at all, but says so explicitly on a browser that has WebXR without the WebGPU binding — that's the difference between an out-of-date visionOS and a bug, and it is not otherwise visible from inside a headset.
+
+Navigation is object-centric. The viewer's rig never moves; the domain is placed a metre and a bit in front of you, scaled so every preset frames the same way, and **pinch and drag to turn it**. On visionOS a pinch arrives as a `transient-pointer` input source that exists only for the duration of the gesture. Its ray is anchored near the shoulder and passes through the pinching hand, so moving that hand changes both where the ray starts and where it points; rather than guess which signal dominates, both are summed, which also makes controllers and gaze work unchanged. Release and it coasts to a stop, and catching it stops it dead. Release velocity is smoothed across frames and capped, because hand tracking drops poses and one long frame reporting an implausible speed will otherwise throw the domain through several turns.
+
+Two things are given up inside a session. Bloom is skipped, since the pass composites through a screen-space render target that the per-eye array texture won't take, so the fire loses its glow. And the quality tier is stepped down to `balanced` for the duration and restored on exit: three currently disables multiview for WebGPU XR, so the volume is raymarched twice per frame at headset resolution, and a fire that judders is worse than one with less detail.
+
 ## Diagnostics
 
 Field statistics can be read back from the GPU at any time, which is how the physics above was verified. In the browser console:

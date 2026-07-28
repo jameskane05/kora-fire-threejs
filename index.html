@@ -41,6 +41,25 @@
         margin-top: 4px;
       }
 
+      #xr-button {
+        position: fixed;
+        left: 50%;
+        bottom: 22px;
+        transform: translateX(-50%);
+        padding: 10px 22px;
+        border: 1px solid #4a4437;
+        border-radius: 999px;
+        background: #16151b;
+        color: var(--fg);
+        font: inherit;
+        letter-spacing: 0.02em;
+        cursor: pointer;
+        z-index: 5;
+      }
+      #xr-button:hover:not(:disabled) { background: #241f18; border-color: #7a6a4a; }
+      #xr-button:disabled { color: var(--dim); cursor: default; opacity: 0.65; }
+      #xr-button[hidden] { display: none; }
+
       #unsupported {
         position: fixed;
         inset: 0;
@@ -59,6 +78,8 @@
   </head>
   <body>
     <div id="app"></div>
+
+    <button id="xr-button" hidden></button>
 
     <div id="hud">
       <div class="title">Kora — physics-based combustion</div>

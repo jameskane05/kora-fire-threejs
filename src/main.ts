@@ -23,7 +23,8 @@ import { createDomainHelper } from './render/DomainHelper';
 import { VolumeRenderer } from './render/VolumeRenderer';
 import { createGui, refreshGui } from './ui/gui';
 import { PRESETS, applyPreset, type Preset } from './ui/presets';
-import { QUALITY, applyQuality, type Quality } from './ui/quality';
+import { QUALITY, QUALITY_TIERS, applyQuality, type Quality } from './ui/quality';
+import { ImmersiveMode } from './xr/ImmersiveMode';
 
 const app = document.getElementById('app') as HTMLDivElement;
 const statsEl = document.getElementById('stats') as HTMLDivElement;
@@ -61,6 +62,10 @@ async function main() {
   renderer.toneMappingExposure = 1.0;
   app.appendChild(renderer.domElement);
 
+  // Set before init(), not after: three requests the adapter during init and forwards this as
+  // `xrCompatible`. Enabling it later leaves the device unusable for an XR session.
+  renderer.xr.enabled = true;
+
   await renderer.init();
 
   const device = (renderer as unknown as { backend?: { device?: GPUDevice } }).backend?.device;
@@ -86,12 +91,21 @@ async function main() {
     { field: solver.renderField, blur: solver.renderBlur },
     params.domainSize,
   );
-  scene.add(volume.mesh);
+  // Everything the viewer looks at hangs off the immersive rig, which is inert on the desktop
+  // and becomes the thing the pointer turns once a session starts.
+  const immersive = new ImmersiveMode(renderer, {
+    onEnter: () => enterImmersive(),
+    onExit: () => exitImmersive(),
+  });
+  scene.add(immersive.rig);
+
+  immersive.attach(volume.mesh);
   solver.reset();
 
   let domainHelper = createDomainHelper(params.domainSize);
   domainHelper.visible = params.showGrid;
-  scene.add(domainHelper);
+  immersive.attach(domainHelper);
+  immersive.setDomainSize(params.domainSize);
 
   // ---- post processing --------------------------------------------------------------------
   const post = new RenderPipeline(renderer);
@@ -126,7 +140,7 @@ async function main() {
   }
 
   function rebuild() {
-    scene.remove(volume.mesh);
+    volume.mesh.removeFromParent();
     solver.dispose();
 
     solver = new KoraSolver(renderer, params, noise);
@@ -134,16 +148,50 @@ async function main() {
       { field: solver.renderField, blur: solver.renderBlur },
       params.domainSize,
     );
-    scene.add(volume.mesh);
+    immersive.attach(volume.mesh);
     solver.reset();
     probes = null;
 
     // The reference geometry is sized to the domain, so it is rebuilt rather than reused.
-    scene.remove(domainHelper);
+    domainHelper.removeFromParent();
     disposeHelper(domainHelper);
     domainHelper = createDomainHelper(params.domainSize);
     domainHelper.visible = params.showGrid;
-    scene.add(domainHelper);
+    immersive.attach(domainHelper);
+
+    immersive.setDomainSize(params.domainSize);
+  }
+
+  /**
+   * A session renders the whole scene twice at headset resolution, which is a great deal more
+   * raymarching than a window. Anything above the immersive tier is stepped down for the
+   * duration and put back on exit, since a fire that judders is worse than one with less detail.
+   */
+  const IMMERSIVE_QUALITY: Quality = 'balanced';
+  let qualityBeforeXR: Quality | null = null;
+
+  function enterImmersive() {
+    controls.enabled = false;
+
+    const order = QUALITY_TIERS.indexOf(params.quality);
+    if (order < QUALITY_TIERS.indexOf(IMMERSIVE_QUALITY)) {
+      qualityBeforeXR = params.quality;
+      params = applyQuality(params, IMMERSIVE_QUALITY);
+      refreshGui(gui);
+      rebuild();
+    }
+  }
+
+  function exitImmersive() {
+    controls.enabled = true;
+    applyPixelRatio(params.quality);
+
+    if (qualityBeforeXR) {
+      params = applyQuality(params, qualityBeforeXR);
+      qualityBeforeXR = null;
+      refreshGui(gui);
+      rebuild();
+    }
   }
 
   // The raymarcher is the only thing in the frame whose cost scales with pixels, so the tier
@@ -297,8 +345,7 @@ async function main() {
   let frames = 0;
   let fps = 0;
 
-  function animate() {
-    requestAnimationFrame(animate);
+  function animate(_time?: number, xrFrame?: XRFrame) {
     if (profiling) return;
 
     const now = performance.now();
@@ -313,13 +360,22 @@ async function main() {
       frames = 0;
     }
 
-    controls.update();
     solver.params.bloom = params.bloom;
     bloomPass.strength.value = params.bloom;
 
     solver.step(dt);
     volume.update(params, frame++);
-    post.render();
+
+    if (immersive.active) {
+      immersive.update(xrFrame ?? null, dt);
+      // The bloom pass composites through a screen-space render target, which is not something
+      // the XR projection layer's per-eye array texture will accept. In a session the volume
+      // goes straight to the eye buffers and loses its glow.
+      renderer.render(scene, camera);
+    } else {
+      controls.update();
+      post.render();
+    }
 
     const n = params.resolution;
     statsEl.textContent = `${n}^3 · ${(n ** 3 / 1e6).toFixed(2)} M voxels · ${fps.toFixed(0)} fps · ${params.fuel}`;
@@ -338,7 +394,11 @@ async function main() {
     }
   });
 
-  animate();
+  // Not requestAnimationFrame: inside a session three has to drive the loop from the headset's
+  // own frame callback, and setAnimationLoop is what lets it take over.
+  renderer.setAnimationLoop(animate);
+
+  void immersive.mountButton(document.getElementById('xr-button') as HTMLButtonElement);
 }
 
 main().catch((err) => {
