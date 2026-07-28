@@ -1,0 +1,104 @@
+# Kora fire in three.js
+
+A browser implementation of the combustion solver described in **[Kora: A Physics-Based Fire Pipeline and Toolset](https://doi.org/10.1145/3819990.3820026)** (Stomakhin et al., Weta FX, DigiPro '26) — the fire system built for *Avatar: Fire and Ash*, which won the VES 2026 Emerging Technology Award. Everything runs on the GPU through WebGPU compute shaders written in TSL.
+
+![Fire tornado preset](docs/fire-tornado.png)
+
+The paper's central argument is that fire behaviour should *emerge from tracked chemistry* rather than from noise and hand-keyed modulation:
+
+> Fuel-rich conditions give rise to oxygen starvation, in which combustion becomes locally oxygen-limited and flame fronts intermittently ignite and extinguish as fresh oxygen is entrained from the surrounding flow. This naturally produces visual phenomena known as choked flames, pulsation, and flickering. Because the solver tracks chemicals and models reactions explicitly, these behaviors emerge directly from the local availability of reactants rather than from heuristic noise or temporal modulation.
+
+So this carries real molar concentrations of fuel, oxygen, nitrogen and combustion products through every voxel, burns them against a stoichiometric limit, and lets the flicker fall out of the chemistry. With the propane torch preset the flame settles at 2200–2700 K, which is propane's adiabatic flame temperature — not a number that was dialled in anywhere.
+
+## Running it
+
+Requires a WebGPU browser: Chrome/Edge 113+, or Safari 18+.
+
+```bash
+npm install
+npm run dev
+```
+
+Known issue: `npm run build` gates on `tsc --noEmit`, which currently runs for many minutes and gets killed rather than reporting an error. The editor's language service checks `src` clean, so this looks like pathological inference against the large `@types/three` graph under TypeScript 7's native compiler, not a real type error. `npx vite build` on its own works.
+
+## There are no particles
+
+This is the thing most worth understanding, and it surprises people.
+
+There are two ways to simulate a fluid. The **Lagrangian** approach uses particles that carry properties like temperature and velocity and physically move through space. The **Eulerian** approach fixes a grid in space and lets fluid flow *through* stationary cells — nothing moves, and what changes is the numbers stored in each cell. Kora is Eulerian, and so is this. There is not one particle anywhere in the codebase.
+
+The status readout says `96^3 · 0.88 M voxels`. That's a 96×96×96 lattice of 884,736 fixed cells filling a 2 m box, so each voxel is a cube roughly 2 cm on a side. That 2 cm is a hard floor on detail: no feature smaller than a voxel can exist. It's precisely why the paper's energy cascade turbulence is needed — it injects swirl to *suggest* structure below grid scale that the grid cannot itself resolve.
+
+Each voxel holds eleven numbers across three RGBA 3D textures:
+
+| Field | Channels |
+| --- | --- |
+| `chem` | fuel, oxygen, nitrogen, products (molar concentrations) |
+| `aux` | soot, temperature (K), released heat, flame-front distance |
+| `vel` | velocity u, v, w |
+
+Each is double-buffered, because WebGPU won't let one compute shader read and write the same texture: a pass reads one copy and writes the other, then they swap. With pressure, divergence and expansion, the core state is about 57 MB of GPU memory.
+
+**Motion without particles** comes from semi-Lagrangian advection, which is confusingly named. Each frame, for every voxel, the solver traces *backwards* along the velocity field to ask "where was the material that's now in me, one timestep ago?" and samples there. It's a backward lookup discarded immediately, with no persistence — see `trace()` in [`advection.ts`](src/sim/passes/advection.ts).
+
+**Velocity lives on faces, not centres.** The x-component sits on the face between a cell and its neighbour in x, and so on. On this staggered (MAC) grid, divergence and pressure gradients become exact differences between adjacent samples instead of wide averages, which is the difference between a stable pressure solve and one that oscillates.
+
+**Nothing is rendered as geometry.** The scene contains exactly one object for the fire: a cube of twelve triangles bounding the domain. The fragment shader takes each pixel that cube covers, casts a ray, and walks it through the 3D textures in up to 160 steps, accumulating emission from the blackbody temperature and opacity from soot and flame. The flame you see is that accumulation — no mesh, no surface, no sprites.
+
+**The flame front is also just a field.** It's a signed distance stored per voxel, negative inside the reaction zone and positive outside, and combustion fires wherever it is at or below zero. The flame's "surface" is implied by the zero crossing and is never explicitly constructed.
+
+Fire suits a grid because the physics is mostly spatial derivatives. Enforcing the ideal gas law means computing divergence; buoyancy means solving a pressure Poisson equation across neighbours; diffusion means averaging with adjacent cells. All natural on a lattice, all awkward with particles.
+
+## Paper sections mapped to code
+
+The solver follows Algorithm 1 of the paper, one pass per step, orchestrated in [`KoraSolver.ts`](src/sim/KoraSolver.ts).
+
+| Paper | Code |
+| --- | --- |
+| §4.3.1 mixture thermodynamics, eq. (15) | [`mixture.ts`](src/sim/mixture.ts) |
+| §4.3 / §4.4 expansion, ideal gas constraint, adiabatic cooling | [`expansion.ts`](src/sim/passes/expansion.ts) |
+| §4.5.1 combustion, soot formation and oxidation, eq. (21) | [`combustion.ts`](src/sim/passes/combustion.ts) |
+| §4.5.2 flame-front SDF and propagation, eq. (22) | [`flameFront.ts`](src/sim/passes/flameFront.ts) |
+| §4.7.1 variable-density pressure projection | [`projection.ts`](src/sim/passes/projection.ts) |
+| §4.7.2 mass diffusion and thermal conduction | [`diffusion.ts`](src/sim/passes/diffusion.ts) |
+| §4.7.3 semi-Lagrangian and MacCormack advection | [`advection.ts`](src/sim/passes/advection.ts) |
+| §4.7.4 radiative cooling | [`radiativeCooling.ts`](src/sim/passes/radiativeCooling.ts) |
+| §4.7.5 dissipation, eq. (28) | [`sourcing.ts`](src/sim/passes/sourcing.ts) |
+| §4.8 energy cascade turbulence, eq. (30) | [`turbulence.ts`](src/sim/passes/turbulence.ts) |
+| §5.1 premixed fuel sourcing and volumetric stamping | [`sourcing.ts`](src/sim/passes/sourcing.ts) |
+| §5.3.1 warped gravity and truncated Coriolis, eq. (36) | [`forces.ts`](src/sim/passes/forces.ts) |
+| §5.3.2 frequency-domain guiding, eq. (38) | [`guiding.ts`](src/sim/passes/guiding.ts) |
+| §5.4.1 blackbody flame colour, hollow flame, eq. (41) | [`VolumeRenderer.ts`](src/render/VolumeRenderer.ts) |
+| §5.4.2 Kora diffusion and crust | [`VolumeRenderer.ts`](src/render/VolumeRenderer.ts) |
+| §6 production setups | [`presets.ts`](src/ui/presets.ts) |
+
+Physical constants and the fuel database are in [`constants.ts`](src/sim/constants.ts). The controls are grouped the way the paper groups its toolset — sourcing, simulation control, art direction, rendering — because §5.2 argues the value is as much in *which* parameters get exposed as in the solver behind them.
+
+## How this differs from production Kora
+
+Kora proper is "a weakly compressible, sparse, spatially adaptive, MPI-distributed physics-based combustion solver" running on a render farm. This is a dense grid in one browser tab, so the differences are substantial and worth being honest about.
+
+The grid here is dense and uniform rather than sparse and spatially adaptive, so memory is spent on empty air and resolution is uniform where Kora refines near the flame. There's no MPI distribution, no liquid-gas coupling or vaporization, and no Houdini integration. The pressure projection is a fixed number of Jacobi iterations rather than a converged solve, so it's formulated in terms of deviation from hydrostatic equilibrium to keep buoyancy correct regardless of convergence. Rendering is single-scattering raymarching rather than Manuka's spectral path tracing. The eq. (30) turbulence filter defaults to an à-trous approximation, with the exact form available as a toggle.
+
+## Diagnostics
+
+Field statistics can be read back from the GPU at any time, which is how the physics above was verified. In the browser console:
+
+```js
+await kora.probe()        // min/max/NaN per field, as a table
+kora.setDebugView('heat') // max-intensity projection of one channel
+kora.findBadPass()        // dispatch each pass alone, name any that fails to compile
+kora.gpuErrors()          // deduplicated WebGPU errors
+```
+
+The debug views step through the shading chain — `temperature`, `heat`, `soot`, `equivalence`, then `flameAlpha`, `blackbody`, `emission` — so a black frame can be attributed to a specific link rather than guessed at.
+
+![Domain grid, origin and simulation bounds](docs/domain-grid.png)
+
+## Credits
+
+All of the science here is from the original paper. Please cite it, not this repository:
+
+> Alexey Stomakhin, John Edholm, Murali Ramachari, Aleksandr Isakov, Zahra Forootaninia, Marcus Schoo, Nicholas Illingworth, and Joe Letteri. 2026. *Kora: A Physics-Based Fire Pipeline and Toolset.* In Proceedings of DigiPro '26. https://doi.org/10.1145/3819990.3820026
+
+The paper is licensed CC BY-NC-ND 4.0. *Kora* is te reo Māori for *spark*.
