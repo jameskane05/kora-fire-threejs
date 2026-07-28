@@ -80,6 +80,34 @@ Kora proper is "a weakly compressible, sparse, spatially adaptive, MPI-distribut
 
 The grid here is dense and uniform rather than sparse and spatially adaptive, so memory is spent on empty air and resolution is uniform where Kora refines near the flame. There's no MPI distribution, no liquid-gas coupling or vaporization, and no Houdini integration. The pressure projection is a fixed number of Jacobi iterations rather than a converged solve, so it's formulated in terms of deviation from hydrostatic equilibrium to keep buoyancy correct regardless of convergence. Rendering is single-scattering raymarching rather than Manuka's spectral path tracing. The eq. (30) turbulence filter defaults to an à-trous approximation, with the exact form available as a toggle.
 
+## Performance
+
+The frame is almost entirely solver. On an M3 Air at 96³ the simulation is ~94% of it and the raymarcher under 3%, which is the opposite of what you might expect from a volume renderer and worth knowing before optimising the wrong thing.
+
+There's a GPU profiler built in. It attributes time per pass using WebGPU timestamp queries, submitting each pass as its own compute group for the duration of a run, and separately measures each stage by ablation on the batched path the app really uses — run the frame, run it again without the stage, take the difference:
+
+```js
+await kora.profile()  // stage budget, then solver passes grouped and individual
+```
+
+Two findings from it paid for themselves immediately, both without any change to the maths:
+
+- **The pressure solve was recomputing its own coefficients.** Every Jacobi sweep evaluated the full mixture density of a cell and its six neighbours, but density is fixed for the whole projection. Caching the face weights, the boundary mask and the Neumann wind faces into two textures once per frame turned a sweep from 1.11 ms into 0.31 ms.
+- **Curl noise was being differenced live.** Six trilinear fetches per band per voxel, twenty-four at the default band count, to take a curl of a static potential. Baking the curl into the noise volume makes it one fetch: 4.36 ms to 1.13 ms.
+
+Together those took the frame from 47 ms to 18.6 ms — 21 fps to 54 fps — at identical quality.
+
+Past that, cost is traded for quality through the `quality` control, which is deliberately separate from the preset: a preset says what the fire *is*, a tier says what it may cost. Measured on the same machine and scene:
+
+| tier | grid | Jacobi | frame | fps |
+| --- | --- | --- | --- | --- |
+| ultra | 128³ | 32 | 49.7 ms | 20 |
+| high | 96³ | 24 | 18.9 ms | 53 |
+| balanced | 80³ | 12 | 8.5 ms | 117 |
+| performance | 64³ | 8 | 3.3 ms | 305 |
+
+The tiers move grid resolution and Jacobi iterations first because that is where the measurement pointed; raymarch steps barely move until the lowest tier, since cutting them buys almost nothing here and costs banding. At `performance` the plume is visibly softer and loses its finest wisps, but it is still recognisably the same fire, and a 3 ms frame leaves room for a game to do everything else.
+
 ## Diagnostics
 
 Field statistics can be read back from the GPU at any time, which is how the physics above was verified. In the browser console:
@@ -87,6 +115,8 @@ Field statistics can be read back from the GPU at any time, which is how the phy
 ```js
 await kora.probe()        // min/max/NaN per field, as a table
 kora.setDebugView('heat') // max-intensity projection of one channel
+kora.setQuality('balanced')
+await kora.advance(120)   // step without requestAnimationFrame, for headless checks
 kora.findBadPass()        // dispatch each pass alone, name any that fails to compile
 kora.gpuErrors()          // deduplicated WebGPU errors
 ```

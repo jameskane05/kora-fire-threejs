@@ -1,8 +1,8 @@
-import type { Data3DTexture } from 'three/webgpu';
 import type { GridOps } from './tsl';
 import type { FieldsView } from './Grid';
 import type { KoraUniforms } from './uniforms';
 import type { Mixture } from './mixture';
+import type { NoiseVolume } from './noise';
 
 /**
  * Everything a compute pass needs: the grid, the fields, the uniforms and the mixture algebra.
@@ -15,6 +15,6 @@ export interface Ctx {
   f: FieldsView;
   u: KoraUniforms;
   m: Mixture;
-  /** tileable vector noise potential for the ECT curl-noise term (§4.8) */
-  noise: Data3DTexture;
+  /** tileable curl-noise volume for the ECT turbulence term (§4.8) */
+  noise: NoiseVolume;
 }

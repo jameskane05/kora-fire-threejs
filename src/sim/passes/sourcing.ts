@@ -64,8 +64,19 @@ export function sourcingPass(ctx: Ctx): N {
     const voxelOf = (o: N) => vec3(c).add(o);
     const mask = sourceMask(u, voxelOf(vec3(0.5))).toVar();
 
-    const rate = u.dt.add(u.sourceImpulse);
-    const emitted = u.sourceMix.mul(mask).mul(rate).toVar();
+    // Continuous emission is a rate; the detonation charge is an amount injected whole. Keeping
+    // them separate is what lets an emitter that is switched off still be detonated.
+    const emitted = u.sourceMix
+      .mul(u.dt)
+      .add(u.detonationMix.mul(u.sourceImpulse))
+      .mul(mask)
+      .toVar();
+
+    // Temperature and velocity are only stamped while the emitter is actually delivering
+    // something. Keying them off the geometric mask alone leaves an idle emitter pinning its
+    // region to the source temperature forever, and — worse for a detonation — pinning the
+    // velocity there to the source velocity, holding the blast still as it tries to expand.
+    const stamp = mask.mul(clamp(u.sourceGate.add(u.sourceImpulse), 0.0, 1.0)).toVar();
 
     fuel.addAssign(emitted.x);
     const oxygen = chem.y.add(emitted.y).toVar();
@@ -77,10 +88,11 @@ export function sourcingPass(ctx: Ctx): N {
     // with them, so each burn stacks its adiabatic rise on the last without bound. Mixing by mole
     // count is the opposite failure: at these flow speeds a voxel empties in milliseconds, far too
     // fast for the injected gas to ever dominate, and the flame starves and blows out.
-    const temperature = mix(aux.y, u.sourceTemperature, mask).toVar();
+    const temperature = mix(aux.y, u.sourceTemperature, stamp).toVar();
 
     // ---- velocity stamp, evaluated per MAC face ----------------------------------------
-    const faceMask = (o: N) => sourceMask(u, voxelOf(o));
+    const gate = clamp(u.sourceGate.add(u.sourceImpulse), 0.0, 1.0);
+    const faceMask = (o: N) => sourceMask(u, voxelOf(o)).mul(gate);
 
     const mx = faceMask(vec3(0.0, 0.5, 0.5));
     const my = faceMask(vec3(0.5, 0.0, 0.5));

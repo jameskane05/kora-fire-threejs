@@ -96,6 +96,8 @@ export interface FieldsView {
   pressure: FieldView;
   divergence: Storage3DTexture;
   expansion: Storage3DTexture;
+  poissonA: Storage3DTexture;
+  poissonB: Storage3DTexture;
 }
 
 export class SimFields {
@@ -106,6 +108,19 @@ export class SimFields {
   readonly divergence: Storage3DTexture;
   /** density scaling s of eq. (10), cached between the expansion pass and the concentration update */
   readonly expansion: Storage3DTexture;
+  /**
+   * Poisson stencil weights, held constant across the Jacobi sweeps.
+   *
+   * Density does not change during the projection, so the face weights 2 / (rho_self + rho_n),
+   * the boundary mask and the Neumann wind faces are all frame constants. Recomputing them
+   * inside each sweep meant a full mixture-density evaluation for seven cells per voxel per
+   * iteration; caching them here turns a sweep into a plain weighted stencil.
+   *
+   *   poissonA = (w[-x], w[+x], w[-y], w[+y])
+   *   poissonB = (w[-z], w[+z], 1 / sum(w), interior)
+   */
+  readonly poissonA: Storage3DTexture;
+  readonly poissonB: Storage3DTexture;
 
   constructor(readonly res: Res) {
     this.chem = new Field(res, 'rgba16f', 'chem');
@@ -114,6 +129,8 @@ export class SimFields {
     this.pressure = new Field(res, 'r32f', 'pressure');
     this.divergence = makeTexture(res, 'r32f', 'divergence');
     this.expansion = makeTexture(res, 'r32f', 'expansion');
+    this.poissonA = makeTexture(res, 'rgba16f', 'poissonA');
+    this.poissonB = makeTexture(res, 'rgba16f', 'poissonB');
   }
 
   get count(): number {
@@ -136,6 +153,8 @@ export class SimFields {
       pressure: { read: this.pressure.read, write: this.pressure.write },
       divergence: this.divergence,
       expansion: this.expansion,
+      poissonA: this.poissonA,
+      poissonB: this.poissonB,
     };
   }
 
@@ -146,5 +165,7 @@ export class SimFields {
     this.pressure.dispose();
     this.divergence.dispose();
     this.expansion.dispose();
+    this.poissonA.dispose();
+    this.poissonB.dispose();
   }
 }

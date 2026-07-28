@@ -1,5 +1,6 @@
 import { Vector3 } from 'three/webgpu';
 import { defaultParams, type KoraParams } from '../sim/params';
+import { applyQuality } from './quality';
 
 /**
  * Setups drawn from the production examples in Kora §6.
@@ -106,6 +107,7 @@ export const PRESETS: Preset[] = [
       domainSize: 8.0,
       sourceEnabled: false,
       sourceAmount: 0,
+      detonationCharge: 9.0,
       oxygenPremix: 0.55,
       sourceRadius: 0.5,
       sourceLength: 0,
@@ -119,7 +121,6 @@ export const PRESETS: Preset[] = [
       sootDissipationRate: 0.1,
       sootOxidationRate: 2.0,
       energyCascadeStrength: 1.6,
-      pressureIterations: 32,
       exposure: 0.8,
       sootDensity: 22,
       koraCrust: 0.75,
@@ -188,8 +189,6 @@ export const PRESETS: Preset[] = [
 export function applyPreset(target: KoraParams, preset: Preset): KoraParams {
   const base: KoraParams = {
     ...defaultParams,
-    resolution: target.resolution,
-    raymarchSteps: target.raymarchSteps,
     substeps: target.substeps,
     sourceDirection: defaultParams.sourceDirection.clone(),
     sourcePosition: defaultParams.sourcePosition.clone(),
@@ -199,5 +198,8 @@ export function applyPreset(target: KoraParams, preset: Preset): KoraParams {
 
   Object.assign(base, preset.params);
   base.preset = preset.name;
-  return base;
+
+  // A preset describes a fire, not a frame budget, so the cost parameters are re-imposed
+  // afterwards from the tier the session is running at rather than coming along with the look.
+  return applyQuality(base, target.quality);
 }

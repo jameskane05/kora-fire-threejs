@@ -21,13 +21,14 @@
  * Compute graphs bake in the texture they read and write, so the whole frame is built twice —
  * once per ping-pong parity — and the two versions alternate.
  */
-import type { Data3DTexture, Renderer, Storage3DTexture } from 'three/webgpu';
+import type { Renderer, Storage3DTexture } from 'three/webgpu';
 import { Field, SimFields, makeTexture, type Res } from './Grid';
 import { gridOps, T, load, type N } from './tsl';
 import { makeMixture } from './mixture';
 import { createUniforms, syncUniforms, type KoraUniforms } from './uniforms';
 import type { KoraParams } from './params';
 import type { Ctx } from './context';
+import type { NoiseVolume } from './noise';
 
 import { sourcingPass, sourceMask, sourceSdf } from './passes/sourcing';
 import type { ProbeChannel, ProbeTextures } from './probe';
@@ -38,7 +39,12 @@ import { radiativeCoolingPass } from './passes/radiativeCooling';
 import { copyPass, energyCascadePass, smoothPass } from './passes/turbulence';
 import { expansionPass, applyExpansionPass } from './passes/expansion';
 import { forcesPass } from './passes/forces';
-import { divergencePass, pressurePass, pressureGradientPass } from './passes/projection';
+import {
+  divergencePass,
+  pressureCoefficientsPass,
+  pressurePass,
+  pressureGradientPass,
+} from './passes/projection';
 import { guidingPass } from './passes/guiding';
 import { advectionPass } from './passes/advection';
 
@@ -98,7 +104,7 @@ export class KoraSolver {
   constructor(
     private readonly renderer: Renderer,
     readonly params: KoraParams,
-    noise: Data3DTexture,
+    noise: NoiseVolume,
   ) {
     const r = params.resolution;
     this.res = [r, r, r];
@@ -239,6 +245,7 @@ export class KoraSolver {
 
     // 16 — pressure projection
     push('divergence', divergencePass(ctx));
+    push('poissonCoefficients', pressureCoefficientsPass(ctx));
     for (let i = 0; i < p.pressureIterations; i++) {
       run(`pressure.${i}`, pressurePass(ctx), f.pressure);
     }
@@ -410,6 +417,14 @@ export class KoraSolver {
     ];
   }
 
+  /** The frame's passes in dispatch order, paired with their names. */
+  framePasses(parity: number): { label: string; node: N }[] {
+    return this.frames[parity].map((node, i) => ({
+      label: this.frameLabels[parity][i],
+      node,
+    }));
+  }
+
   /** The frame's passes, paired with their names, for isolating a failing kernel. */
   passes(parity = 0): { label: string; node: N }[] {
     const init = this.initNodes[parity].map((node, i) => ({ label: `init.${i}`, node }));
@@ -432,6 +447,24 @@ export class KoraSolver {
 
   /** Advances the simulation. Returns the timestep actually taken. */
   step(dt: number): number {
+    return this.advance(dt, (parity) => this.renderer.compute(this.frames[parity]));
+  }
+
+  /**
+   * A step with every pass submitted as its own compute group, so each carries its own timestamp
+   * query. `after` runs immediately following each dispatch, while the pass's query id is still
+   * the current one. Measurement only: the batched path shares a command encoder and is faster.
+   */
+  stepUnbatched(dt: number, after: (label: string, node: N) => void): number {
+    return this.advance(dt, (parity) => {
+      for (const { label, node } of this.framePasses(parity)) {
+        this.renderer.compute(node);
+        after(label, node);
+      }
+    });
+  }
+
+  private advance(dt: number, dispatch: (parity: number) => void): number {
     const p = this.params;
     const sub = Math.max(1, Math.floor(p.substeps));
     const h = Math.min(dt, 1 / 30) / sub;
@@ -443,7 +476,7 @@ export class KoraSolver {
       this.uniforms.dt.value = h;
       this.uniforms.time.value = this.elapsed;
 
-      this.renderer.compute(this.frames[this.parity]);
+      dispatch(this.parity);
       this.parity ^= 1;
 
       // A detonation charge is a one-shot stamp, consumed by the frame that saw it.

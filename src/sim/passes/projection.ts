@@ -34,12 +34,6 @@ import type { Ctx } from '../context';
 
 const { float, ivec3, vec3, vec4, dot, log, max, textureStore } = T;
 
-const AXES = [
-  [1, 0, 0],
-  [0, 1, 0],
-  [0, 0, 1],
-] as const;
-
 export interface Density {
   /** Mixture density of a cell. Ghost cells always hold quiescent ambient air. */
   at(c: N): N;
@@ -91,6 +85,59 @@ export function divergencePass(ctx: Ctx): N {
   });
 }
 
+/** The six face steps in the order the coefficient textures pack them. */
+const FACES = [
+  [-1, 0, 0],
+  [1, 0, 0],
+  [0, -1, 0],
+  [0, 1, 0],
+  [0, 0, -1],
+  [0, 0, 1],
+] as const;
+
+/**
+ * Bakes the Poisson stencil for the frame.
+ *
+ * Everything the Jacobi sweep needs besides the pressures themselves is constant while the solve
+ * runs: density is not touched again until `applyExpansion`, and the wind boundary is a uniform.
+ * The common factor dt / dx^2 is left out and folded into the right-hand side instead, so the
+ * stored weights stay near unity and survive a half-float round trip.
+ */
+export function pressureCoefficientsPass(ctx: Ctx): N {
+  const { g, f, u } = ctx;
+  const density = makeDensity(ctx);
+
+  return g.kernel(() => {
+    const c = g.coord();
+    const rhoSelf = density.at(c);
+
+    const w: N[] = FACES.map((step) => {
+      const n = c.add(ivec3(step[0], step[1], step[2]));
+      const rhoFace = rhoSelf.add(density.at(n)).mul(0.5);
+
+      // Neumann on wind inflow faces: a prescribed flux means no pressure coupling.
+      const inflow = dot(u.wind, vec3(step[0], step[1], step[2]).negate()).greaterThan(float(0.0));
+      const neumann = g
+        .interior(n)
+        .not()
+        .and(inflow)
+        .and(u.windEnabled.greaterThan(float(0.5)));
+
+      return neumann.select(float(0.0), float(1.0).div(rhoFace));
+    });
+
+    // Floored well above zero rather than at an epsilon: the reciprocal is stored as a half
+    // float, so a 1e-12 guard would come back as an infinity and turn the boundary mask's
+    // multiply by zero into a NaN that spreads through the whole field in a few sweeps.
+    const total = w.reduce((a, b) => a.add(b));
+    const invTotal = float(1.0).div(max(total, float(1e-3)));
+    const interior = g.interior(c).select(float(1.0), float(0.0));
+
+    textureStore(f.poissonA, c, vec4(w[0], w[1], w[2], w[3])).toWriteOnly();
+    textureStore(f.poissonB, c, vec4(w[4], w[5], invTotal, interior)).toWriteOnly();
+  });
+}
+
 /**
  * One Jacobi sweep of div(beta grad p') = rhs with beta = dt / rho_face.
  * Ghost cells are pinned to zero: the hydrostatic column they would otherwise carry has been
@@ -98,43 +145,22 @@ export function divergencePass(ctx: Ctx): N {
  */
 export function pressurePass(ctx: Ctx): N {
   const { g, f, u } = ctx;
-  const density = makeDensity(ctx);
 
   return g.kernel(() => {
     const c = g.coord();
-    const rhs = load(f.divergence, c).x;
-    const rhoSelf = density.at(c);
-    const dx2 = u.dx.mul(u.dx);
 
-    const sum = float(0.0).toVar();
-    const weight = float(0.0).toVar();
+    const a = load(f.poissonA, c);
+    const b = load(f.poissonB, c);
+    const w = [a.x, a.y, a.z, a.w, b.x, b.y];
 
-    for (const axis of AXES) {
-      for (const sign of [-1, 1] as const) {
-        const step = ivec3(axis[0] * sign, axis[1] * sign, axis[2] * sign);
-        const n = c.add(step);
+    const sum = FACES.map((step, i) =>
+      w[i].mul(g.fetch(f.pressure.read, c.add(ivec3(step[0], step[1], step[2]))).x),
+    ).reduce((x, y) => x.add(y));
 
-        const rhoFace = rhoSelf.add(density.at(n)).mul(0.5);
-        const beta = u.dt.div(rhoFace).div(dx2);
+    // dt / dx^2 was factored out of the weights, so it reappears here scaling the residual.
+    const rhs = load(f.divergence, c).x.mul(u.dx).mul(u.dx).div(u.dt);
 
-        // Neumann on wind inflow faces: a prescribed flux means no pressure coupling.
-        const inflow = dot(u.wind, vec3(step).negate()).greaterThan(float(0.0));
-        const neumann = g
-          .interior(n)
-          .not()
-          .and(inflow)
-          .and(u.windEnabled.greaterThan(float(0.5)));
-        const b = neumann.select(float(0.0), beta);
-
-        sum.addAssign(b.mul(g.fetch(f.pressure.read, n).x));
-        weight.addAssign(b);
-      }
-    }
-
-    const solved = sum.sub(rhs).div(max(weight, float(1e-12)));
-    const p = g.interior(c).select(solved, float(0.0));
-
-    textureStore(f.pressure.write, c, vec4(p)).toWriteOnly();
+    textureStore(f.pressure.write, c, vec4(sum.sub(rhs).mul(b.z).mul(b.w))).toWriteOnly();
   });
 }
 

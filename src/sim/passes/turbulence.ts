@@ -74,9 +74,13 @@ export function copyPass(ctx: Ctx, src: Storage3DTexture, dst: Storage3DTexture)
 }
 
 /**
- * Curl of a tileable vector noise potential, sampled at feature size `scale` voxels.
+ * Curl noise at feature size `scale` voxels.
  * "The fundamental building block of ECT is curl noise [Bridson et al. 2007], which generates
  * incompressible velocity fields by applying the curl operator to a vector noise potential."
+ *
+ * The curl itself is baked into the volume (see `noise.ts`), so this is one fetch rather than the
+ * six the central differences used to take. The result is O(1) at every band; the physical
+ * magnitude comes entirely from the eq. (33) amplitude.
  */
 function curlNoise(ctx: Ctx, p: N, scale: number, phase: number): N {
   const { noise, u } = ctx;
@@ -85,17 +89,12 @@ function curlNoise(ctx: Ctx, p: N, scale: number, phase: number): N {
   // The noise volume tiles, so an arbitrary per-band offset keeps every band decorrelated
   // without seams. A slow drift keeps the injected detail from looking stapled to the grid.
   const offset = vec3(phase * 0.37, u.time.mul(0.09 * (1 + phase * 0.3)), phase * 0.71);
-  const potential = (q: N) =>
-    texture3D(noise, q.div(period).add(offset)).level(int(0)).xyz.sub(0.5).mul(2.0);
+  const q = p.div(period).add(offset);
 
-  // Central differences over the band's own feature size, which leaves the curl O(1) at every
-  // band; the physical magnitude comes entirely from the eq. (33) amplitude.
-  const h = float(Math.max(scale, 1) * 0.5);
-  const dx = potential(p.add(vec3(h, 0, 0))).sub(potential(p.sub(vec3(h, 0, 0))));
-  const dy = potential(p.add(vec3(0, h, 0))).sub(potential(p.sub(vec3(0, h, 0))));
-  const dz = potential(p.add(vec3(0, 0, h))).sub(potential(p.sub(vec3(0, 0, h))));
-
-  return vec3(dy.z.sub(dz.y), dz.x.sub(dx.z), dx.y.sub(dy.x));
+  return texture3D(noise.texture, q)
+    .level(int(0))
+    .xyz.sub(0.5)
+    .mul(2.0 * noise.scale);
 }
 
 /**

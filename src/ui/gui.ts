@@ -3,6 +3,7 @@ import { DEBUG_CHANNELS } from '../render/VolumeRenderer';
 import { FUELS } from '../sim/constants';
 import type { KoraParams } from '../sim/params';
 import { PRESETS, type Preset } from './presets';
+import { QUALITY, QUALITY_TIERS, type Quality } from './quality';
 
 /**
  * The control panel is grouped the way Kora's toolset is (§5): sourcing, simulation control,
@@ -16,6 +17,8 @@ export interface GuiCallbacks {
   onReset(): void;
   onDetonate(): void;
   onProbe(): void;
+  onProfile(): void;
+  onQuality(quality: Quality): void;
   onShowGrid(visible: boolean): void;
 }
 
@@ -37,6 +40,16 @@ export function createGui(params: KoraParams, cb: GuiCallbacks): GUI {
       if (preset) cb.onPreset(preset);
     });
 
+  // Separate from the preset on purpose: this is the frame budget, not the fire.
+  const quality = gui
+    .add(params, 'quality', [...QUALITY_TIERS])
+    .name('quality')
+    .onChange((q: Quality) => {
+      quality.$widget.title = QUALITY[q].note;
+      cb.onQuality(q);
+    });
+  quality.$widget.title = QUALITY[params.quality].note;
+
   gui.add(actions, 'detonate').name('detonate (§4.4 charge)');
   gui.add(actions, 'reset').name('reset domain');
 
@@ -48,6 +61,7 @@ export function createGui(params: KoraParams, cb: GuiCallbacks): GUI {
     .name('fuel')
     .onChange(() => cb.onReset());
   src.add(params, 'sourceAmount', 0, 12, 0.05).name('mixture amount');
+  src.add(params, 'detonationCharge', 0, 30, 0.1).name('detonation charge');
   src.add(params, 'oxygenPremix', 0, 1.2, 0.01).name('oxygen pre-mix (1/phi)');
   src.add(params, 'sourceTemperature', 400, 3000, 10).name('temperature K');
   src.add(params, 'sourceRadius', 0.01, 1.0, 0.005).name('radius m');
@@ -159,6 +173,7 @@ export function createGui(params: KoraParams, cb: GuiCallbacks): GUI {
   debug.add(params, 'debugView', [...DEBUG_CHANNELS]).name('channel view');
   debug.add(params, 'debugScale', 0.01, 20, 0.01).name('channel scale');
   debug.add({ probe: () => cb.onProbe() }, 'probe').name('log field stats');
+  debug.add({ profile: () => cb.onProfile() }, 'profile').name('profile GPU (~2 s)');
   debug.close();
 
   return gui;

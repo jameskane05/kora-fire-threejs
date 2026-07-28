@@ -76,8 +76,12 @@ export function createUniforms(params: KoraParams) {
     sourceTemperature: uniform(params.sourceTemperature),
     /** premixed emission per second, as concentrations: (fuel, O2, N2, 0) */
     sourceMix: uniform(new Vector4()),
+    /** premixed detonation charge, injected whole on the frame the impulse fires */
+    detonationMix: uniform(new Vector4()),
     /** one-shot charge multiplier, consumed on the frame it is set */
     sourceImpulse: uniform(0),
+    /** 1 while the emitter is running, so an idle emitter stops stamping the domain */
+    sourceGate: uniform(0),
 
     // art direction, §5.3
     gravity: uniform(new Vector3(0, -9.80665, 0)),
@@ -167,8 +171,16 @@ export function syncUniforms(u: KoraUniforms, p: KoraParams): void {
   u.sourceVelocity.value.copy(dir).multiplyScalar(p.sourceSpeed);
   u.sourceTemperature.value = p.sourceTemperature;
 
-  const mix = premix(p.sourceEnabled ? p.sourceAmount : 0, p.oxygenPremix, fuel.stoichO2);
+  const emitting = p.sourceEnabled && p.sourceAmount > 0;
+  u.sourceGate.value = emitting ? 1 : 0;
+
+  const mix = premix(emitting ? p.sourceAmount : 0, p.oxygenPremix, fuel.stoichO2);
   u.sourceMix.value.set(mix.fuel, mix.oxygen, mix.nitrogen, 0);
+
+  // The charge is premixed independently of the continuous rate, so a detonation still has fuel
+  // to burn in setups that emit nothing at all — which is exactly the §4.4 explosion scenario.
+  const charge = premix(p.detonationCharge, p.oxygenPremix, fuel.stoichO2);
+  u.detonationMix.value.set(charge.fuel, charge.oxygen, charge.nitrogen, 0);
 
   u.gravity.value.set(0, -p.gravity, 0);
   u.updraftStrength.value = p.updraftStrength;

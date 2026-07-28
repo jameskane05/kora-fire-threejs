@@ -13,6 +13,7 @@ import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 import { installGpuErrorReporter, gpuErrorSummary } from './debug/gpuErrors';
+import { disarmTimestamps, profile, printProfile, type ProfileOptions } from './debug/profile';
 import { KoraSolver } from './sim/KoraSolver';
 import { FieldProbe } from './sim/probe';
 import { gridOps } from './sim/tsl';
@@ -22,6 +23,7 @@ import { createDomainHelper } from './render/DomainHelper';
 import { VolumeRenderer } from './render/VolumeRenderer';
 import { createGui, refreshGui } from './ui/gui';
 import { PRESETS, applyPreset, type Preset } from './ui/presets';
+import { QUALITY, applyQuality, type Quality } from './ui/quality';
 
 const app = document.getElementById('app') as HTMLDivElement;
 const statsEl = document.getElementById('stats') as HTMLDivElement;
@@ -47,8 +49,13 @@ async function main() {
     if (typeof value === 'number') requiredLimits[limit] = value;
   }
 
-  const renderer = new WebGPURenderer({ antialias: false, forceWebGL: false, requiredLimits });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+  // trackTimestamp only arms the query pool; nothing is resolved until the profiler asks.
+  const renderer = new WebGPURenderer({
+    antialias: false,
+    forceWebGL: false,
+    requiredLimits,
+    trackTimestamp: true,
+  });
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.toneMapping = ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
@@ -58,6 +65,8 @@ async function main() {
 
   const device = (renderer as unknown as { backend?: { device?: GPUDevice } }).backend?.device;
   if (device) installGpuErrorReporter(device);
+
+  disarmTimestamps(renderer);
 
   const scene = new Scene();
   scene.background = new Color(0x05060a);
@@ -70,6 +79,7 @@ async function main() {
 
   const noise = createNoiseVolume(32);
   let params: KoraParams = applyPreset({ ...defaultParams }, PRESETS[0]);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, QUALITY[params.quality].pixelRatio));
 
   let solver = new KoraSolver(renderer, params, noise);
   let volume = new VolumeRenderer(
@@ -136,6 +146,13 @@ async function main() {
     scene.add(domainHelper);
   }
 
+  // The raymarcher is the only thing in the frame whose cost scales with pixels, so the tier
+  // caps the device ratio rather than the window size.
+  function applyPixelRatio(quality: Quality) {
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, QUALITY[quality].pixelRatio));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
   function disposeHelper(group: Group) {
     group.traverse((o) => {
       const line = o as Partial<Line>;
@@ -158,6 +175,37 @@ async function main() {
     return flat;
   }
 
+  // The profiler drives the solver and the renderer itself and times the result, so the animation
+  // loop has to stand down for the duration or its frames land in the middle of a measurement.
+  let profiling = false;
+
+  async function runProfile(options?: ProfileOptions) {
+    if (profiling) return null;
+    profiling = true;
+    try {
+      const result = await profile(
+        {
+          renderer,
+          solver,
+          render: () => post.render(),
+          setVolumeVisible: (v) => {
+            volume.mesh.visible = v;
+          },
+          setBloom: (s) => {
+            bloomPass.strength.value = s;
+          },
+          bloomStrength: params.bloom,
+        },
+        options,
+      );
+      printProfile(result);
+      return result;
+    } finally {
+      profiling = false;
+      last = performance.now();
+    }
+  }
+
   let gui = createGui(params, callbacks());
 
   function callbacks() {
@@ -174,6 +222,13 @@ async function main() {
       onReset: () => rebuild(),
       onDetonate: () => solver.detonate(1.0),
       onProbe: () => void logProbe(),
+      onProfile: () => void runProfile(),
+      onQuality: (q: Quality) => {
+        params = applyQuality(params, q);
+        applyPixelRatio(q);
+        refreshGui(gui);
+        rebuild();
+      },
       onShowGrid: (visible: boolean) => {
         domainHelper.visible = visible;
       },
@@ -184,6 +239,8 @@ async function main() {
   // automated check, without going through the GUI.
   (window as unknown as Record<string, unknown>).kora = {
     probe: logProbe,
+    profile: runProfile,
+    setQuality: (q: Quality) => callbacks().onQuality(q),
     params: () => params,
     setDebugView: (v: KoraParams['debugView'], scale = 1) => {
       params.debugView = v;
@@ -198,6 +255,17 @@ async function main() {
     // Refilling the domain only re-runs the init kernels; rebuilding tears down and recompiles
     // every compute graph, which is only needed when a parameter changes the graph's shape.
     reset: () => solver.reset(),
+    // Drives the solver without the animation loop, for environments where requestAnimationFrame
+    // never fires — an automated browser view, or a backgrounded tab.
+    advance: async (count = 60, dt = 1 / 60) => {
+      for (let i = 0; i < count; i++) {
+        solver.step(dt);
+        volume.update(params, frame++);
+      }
+      post.render();
+      await device?.queue.onSubmittedWorkDone();
+      return count;
+    },
     rebuild: () => rebuild(),
     // Dispatches each pass alone inside an error scope, so a shader that fails to compile is
     // reported by name instead of as an anonymous pipeline in a cascade of follow-on errors.
@@ -230,6 +298,9 @@ async function main() {
   let fps = 0;
 
   function animate() {
+    requestAnimationFrame(animate);
+    if (profiling) return;
+
     const now = performance.now();
     const dt = Math.min((now - last) / 1000, 0.05);
     last = now;
@@ -252,14 +323,12 @@ async function main() {
 
     const n = params.resolution;
     statsEl.textContent = `${n}^3 · ${(n ** 3 / 1e6).toFixed(2)} M voxels · ${fps.toFixed(0)} fps · ${params.fuel}`;
-
-    requestAnimationFrame(animate);
   }
 
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
+    applyPixelRatio(params.quality);
   });
 
   window.addEventListener('keydown', (e) => {

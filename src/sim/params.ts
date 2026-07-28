@@ -1,6 +1,7 @@
 import { Vector3 } from 'three/webgpu';
 import type { FuelName } from './constants';
 import type { DebugChannel } from '../render/VolumeRenderer';
+import type { Quality } from '../ui/quality';
 
 /**
  * The artist-facing parameter set.
@@ -14,6 +15,8 @@ import type { DebugChannel } from '../render/VolumeRenderer';
 export interface KoraParams {
   /** Name of the §6 preset last applied. Held here so it survives the GUI being rebuilt. */
   preset: string;
+  /** Cost tier. Owns the solver's expensive knobs; the preset owns the look. */
+  quality: Quality;
 
   // ---- solver / domain (expert; changing these rebuilds the solver) ----
   resolution: number;
@@ -101,6 +104,7 @@ export interface KoraParams {
 
 export const defaultParams: KoraParams = {
   preset: 'Torch',
+  quality: 'high',
 
   resolution: 96,
   domainSize: 4.0,
@@ -119,7 +123,7 @@ export const defaultParams: KoraParams = {
   sourcePosition: new Vector3(0, 0.35, 0),
   sourceLength: 0.0,
   sourceEnabled: true,
-  detonationCharge: 0,
+  detonationCharge: 4.0,
 
   combustionRate: 26.0,
   flameSpeed: 0.45,
