@@ -6,6 +6,7 @@ import {
   PerspectiveCamera,
   RenderPipeline,
   Scene,
+  Vector3,
   WebGPURenderer,
 } from 'three/webgpu';
 import { pass } from 'three/tsl';
@@ -24,6 +25,7 @@ import { VolumeRenderer } from './render/VolumeRenderer';
 import { createGui, refreshGui } from './ui/gui';
 import { PRESETS, applyPreset, type Preset } from './ui/presets';
 import { QUALITY, QUALITY_TIERS, applyQuality, type Quality } from './ui/quality';
+import { Hands, previewHand } from './xr/Hands';
 import { ImmersiveMode } from './xr/ImmersiveMode';
 
 const app = document.getElementById('app') as HTMLDivElement;
@@ -98,6 +100,10 @@ async function main() {
     onExit: () => exitImmersive(),
   });
   scene.add(immersive.rig);
+
+  // Hands go in the scene, not on the rig: they are tracked against the real world and have to
+  // stay at life size, while the rig scales the domain down to something you can hold.
+  const hands = new Hands(renderer, scene);
 
   immersive.attach(volume.mesh);
   solver.reset();
@@ -303,6 +309,17 @@ async function main() {
     // Refilling the domain only re-runs the init kernels; rebuilding tears down and recompiles
     // every compute graph, which is only needed when a parameter changes the graph's shape.
     reset: () => solver.reset(),
+    // The hand shader is only ever seen inside a headset; this puts one on screen, and frames it,
+    // so it can be looked at without one.
+    previewHand: async (handedness: 'left' | 'right' = 'right') => {
+      // Low on the plume axis, so the shell is judged against flame rather than against black.
+      const at = new Vector3(0, params.domainSize * 0.3, 0);
+      const object = await previewHand(scene, handedness, at);
+      camera.position.set(at.x + 0.28, at.y + 0.1, at.z + 0.38);
+      controls.target.copy(at);
+      controls.update();
+      return object;
+    },
     // Drives the solver without the animation loop, for environments where requestAnimationFrame
     // never fires — an automated browser view, or a backgrounded tab.
     advance: async (count = 60, dt = 1 / 60) => {
@@ -368,6 +385,7 @@ async function main() {
 
     if (immersive.active) {
       immersive.update(xrFrame ?? null, dt);
+      hands.update();
       // The bloom pass composites through a screen-space render target, which is not something
       // the XR projection layer's per-eye array texture will accept. In a session the volume
       // goes straight to the eye buffers and loses its glow.

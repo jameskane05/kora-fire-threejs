@@ -123,6 +123,19 @@ The button stays hidden where immersive VR isn't offered at all, but says so exp
 
 Navigation is object-centric. The viewer's rig never moves; the domain is placed a metre and a bit in front of you, scaled so every preset frames the same way, and **pinch and drag to turn it**. On visionOS a pinch arrives as a `transient-pointer` input source that exists only for the duration of the gesture. Its ray is anchored near the shoulder and passes through the pinching hand, so moving that hand changes both where the ray starts and where it points; rather than guess which signal dominates, both are summed, which also makes controllers and gaze work unchanged. Release and it coasts to a stop, and catching it stops it dead. Release velocity is smoothed across frames and capped, because hand tracking drops poses and one long frame reporting an implausible speed will otherwise throw the domain through several turns.
 
+### Hands
+
+Hand tracking is on, and your hands are drawn as a rigged mesh rather than as joint spheres. The model is the reference hand from `@webxr-input-profiles/assets` — the one three's `XRHandModelFactory` expects — vendored into `public/hands/` instead of pulled from the CDN three defaults to, so it loads on a local network. WebXR reports twenty-five joints per hand and three poses the glTF skeleton from them each frame.
+
+The asset ships with an opaque skin material, which is wrong here twice over: this scene has no lights, so a lit material renders black, and solid hands in front of a volumetric fire hide the thing you came to look at. It's replaced with an unlit fresnel shell — about 5% opacity face-on rising to 85% at grazing angles — so what you see is a glass outline you can watch the fire through. The tint is cool against the fire's orange, so a hand in front of a flame stays legible.
+
+Two details that aren't obvious:
+
+- **The wrist fade.** The model stops at the wrist in a hard open ring, which reads as a severed hand. It's dissolved over the 20–100 mm around the tracked wrist joint. That has to key off world-space distance rather than anything in the mesh, because the geometry is skinned and its bind-pose coordinates no longer say where a vertex ended up — but `positionWorld` does follow the skinning, since three's `setupPosition` runs `skinning()` into `positionLocal` first.
+- **Draw order.** Neither the hands nor the volume write depth, so which appears in front is decided by draw order alone. The volume renders at 10 and the hands at 20, which means you can always see where your hands are even when they're inside the fire; because the shell is mostly transparent the flame still shows through, so it reads as the hand being lit from within rather than as it floating in front of something it should be inside.
+
+`kora.previewHand()` drops one into the desktop scene in its rest pose, wearing the same material — the shader is otherwise impossible to iterate on without putting a headset on.
+
 Two things are given up inside a session. Bloom is skipped, since the pass composites through a screen-space render target that the per-eye array texture won't take, so the fire loses its glow. And the quality tier is stepped down to `balanced` for the duration and restored on exit: three currently disables multiview for WebGPU XR, so the volume is raymarched twice per frame at headset resolution, and a fire that judders is worse than one with less detail.
 
 ## Diagnostics
