@@ -19,6 +19,8 @@ npm install
 npm run dev
 ```
 
+The dev server is HTTPS on the LAN address as well as localhost, which is there for the headset: WebXR needs a secure context, and a Vision Pro reaching this machine over the network doesn't get localhost's exemption. The certificate is self-signed, so Safari will ask you to accept it once before the VR button will do anything.
+
 Known issue: `npm run build` gates on `tsc --noEmit`, which currently runs for many minutes and gets killed rather than reporting an error. The editor's language service checks `src` clean, so this looks like pathological inference against the large `@types/three` graph under TypeScript 7's native compiler, not a real type error. `npx vite build` on its own works.
 
 ## There are no particles
