@@ -2,6 +2,8 @@
 
 A browser implementation of the combustion solver described in **[Kora: A Physics-Based Fire Pipeline and Toolset](https://doi.org/10.1145/3819990.3820026)** (Stomakhin et al., Weta FX, DigiPro '26) — the fire system built for *Avatar: Fire and Ash*, which won the VES 2026 Emerging Technology Award. Everything runs on the GPU through WebGPU compute shaders written in TSL.
 
+**[Live demo](https://jameskane05.github.io/kora-fire-threejs/)** — needs a WebGPU browser.
+
 ![Fire tornado preset](docs/fire-tornado.png)
 
 The paper's central argument is that fire behaviour should *emerge from tracked chemistry* rather than from noise and hand-keyed modulation:
@@ -20,6 +22,8 @@ npm run dev
 ```
 
 The dev server is HTTPS on the LAN address as well as localhost, which is there for the headset: WebXR needs a secure context, and a Vision Pro reaching this machine over the network doesn't get localhost's exemption. The certificate is self-signed, so Safari will ask you to accept it once before the VR button will do anything.
+
+`npm run deploy` builds and force-pushes `dist` to the `gh-pages` branch. The build sets a `/kora-fire-threejs/` base path, since Pages serves a project repository from a subdirectory; the dev server stays at the root.
 
 Known issue: `npm run build` gates on `tsc --noEmit`, which currently runs for many minutes and gets killed rather than reporting an error. The editor's language service checks `src` clean, so this looks like pathological inference against the large `@types/three` graph under TypeScript 7's native compiler, not a real type error. `npx vite build` on its own works.
 
