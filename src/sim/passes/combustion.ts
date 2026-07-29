@@ -59,10 +59,18 @@ export function combustionPass(ctx: Ctx): N {
     // ---- soot formation, §4.5.1 ------------------------------------------------------------
     // "When excess fuel remains after oxygen has been locally depleted, carbon-rich
     //  intermediates can nucleate into soot particles."
+    //
+    // Gated on heat rather than on the flame front. Inception is pyrolysis — fuel breaking down
+    // thermally — and it wants a hot, oxygen-starved region, which is precisely a region the front
+    // does not reach: the front only covers cells inside the flammability limits, and a rich core
+    // sits above the rich limit by definition. Requiring both confined nucleation to the narrow
+    // band where phi is between 1 and the rich limit, which is also the one place there is spare
+    // oxygen to burn the soot straight back off, so almost none survived to become smoke.
+    const pyrolysing = step(u.ignitionTemperature, temperature);
     const excessFuel = max(fuel.sub(oxygen.div(u.stoichO2)), float(0.0));
     const nucleated = excessFuel
       .mul(oneMinus(exp(u.sootFormationRate.negate().mul(u.dt))))
-      .mul(burning);
+      .mul(pyrolysing);
     fuel.subAssign(nucleated);
     soot.addAssign(nucleated);
 

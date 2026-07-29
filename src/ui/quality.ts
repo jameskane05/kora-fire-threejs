@@ -28,6 +28,14 @@ export interface QualitySettings {
   raymarchSteps: number;
   /** render-target scale; the raymarcher is the only thing here that cares about pixels */
   pixelRatio: number;
+  /**
+   * Fraction of the headset's recommended eye resolution to render at.
+   *
+   * `pixelRatio` does nothing in a session — the projection layer's size comes from the
+   * compositor, not from the canvas — so this is the tier's only pixel lever there, and it has to
+   * be a far harsher one. A Vision Pro recommends 4851x3887 per eye, and there are two of them.
+   */
+  xrScale: number;
   note: string;
 }
 
@@ -39,6 +47,7 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     macCormack: true,
     raymarchSteps: 200,
     pixelRatio: 1.5,
+    xrScale: 0.6,
     note: 'offline-ish: 2.1 M voxels, for stills and turntables',
   },
   high: {
@@ -48,6 +57,7 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     macCormack: true,
     raymarchSteps: 160,
     pixelRatio: 1.5,
+    xrScale: 0.5,
     note: 'the authored look; everything the paper describes, at full strength',
   },
   balanced: {
@@ -57,6 +67,7 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     macCormack: true,
     raymarchSteps: 120,
     pixelRatio: 1.25,
+    xrScale: 0.4,
     note: 'halves the solve and drops the coarsest turbulence band; reads the same in motion',
   },
   performance: {
@@ -66,6 +77,7 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     macCormack: false,
     raymarchSteps: 80,
     pixelRatio: 1.0,
+    xrScale: 0.3,
     note: 'game budget: softer plume and less fine detail, an order of magnitude cheaper',
   },
 };

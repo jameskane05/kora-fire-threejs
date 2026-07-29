@@ -130,7 +130,9 @@ The tiers move grid resolution and Jacobi iterations first because that is where
 
 ## Immersive VR
 
-There's an **Enter VR** button on headsets that can run it, tested against Safari on visionOS.
+There's an **Enter VR** button on headsets that can run it.
+
+**It does not currently work on visionOS.** The session opens, renders two frames, and then stops being asked for more, with no error and no `end` event. Frame cost, submission validity and the tone-mapping path have all been ruled out, and seven separate WebKit and three.js bugs were found and worked around before getting this far; none of them was the cause, and the cause is still open. The measurements are in [docs/visionos-webgpu-webxr.md](docs/visionos-webgpu-webxr.md). Everything below is implemented and works on desktop.
 
 The requirement worth calling out is that the session has to be WebGPU-backed. The solver *is* compute shaders, so there is no WebGL path to fall back to, and until WebKit shipped the WebXR/WebGPU binding this could not have worked on the device at all. Two things follow, both easy to get wrong:
 
@@ -172,7 +174,7 @@ Two details that aren't obvious:
 
 `kora.previewHand()` drops one into the desktop scene in its rest pose, wearing the same material — the shader is otherwise impossible to iterate on without putting a headset on.
 
-Two things are given up inside a session. Bloom is skipped, since the pass composites through a screen-space render target that the per-eye array texture won't take, so the fire loses its glow. And the quality tier is stepped down to `balanced` for the duration and restored on exit: three currently disables multiview for WebGPU XR, so the volume is raymarched twice per frame at headset resolution, and a fire that judders is worse than one with less detail.
+Two things are given up inside a session. Bloom is skipped, since the pass composites through a screen-space render target that the per-eye array texture won't take, so the fire loses its glow. And the quality tier is stepped down to `performance` for the duration and restored on exit: three currently disables multiview for WebGPU XR, so the volume is raymarched twice per frame at headset resolution, and a fire that judders is worse than one with less detail. Each tier also carries an `xrScale`, the fraction of the compositor's recommended eye resolution to actually render — the recommendation on a Vision Pro is 4851×3887 per eye, which is far more raymarching than the device can carry.
 
 ## Diagnostics
 
@@ -198,3 +200,5 @@ All of the science here is from the original paper. Please cite it, not this rep
 > Alexey Stomakhin, John Edholm, Murali Ramachari, Aleksandr Isakov, Zahra Forootaninia, Marcus Schoo, Nicholas Illingworth, and Joe Letteri. 2026. *Kora: A Physics-Based Fire Pipeline and Toolset.* In Proceedings of DigiPro '26. https://doi.org/10.1145/3819990.3820026
 
 The paper is licensed CC BY-NC-ND 4.0. *Kora* is te reo Māori for *spark*.
+
+The backdrops in `public/env/` are CC0 from [Poly Haven](https://polyhaven.com/). The hand mesh in `public/hands/` is the reference model from [`@webxr-input-profiles/assets`](https://github.com/immersive-web/webxr-input-profiles) (Apache-2.0).

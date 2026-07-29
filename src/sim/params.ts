@@ -3,6 +3,7 @@ import type { FuelName } from './constants';
 import type { DebugChannel } from '../render/VolumeRenderer';
 import type { Quality } from '../ui/quality';
 import type { GizmoMode } from './obstacles';
+import { DEFAULT_INTENSITY, type EnvironmentName } from '../scene/Environment';
 
 /**
  * The artist-facing parameter set.
@@ -31,7 +32,14 @@ export interface KoraParams {
 
   // ---- sourcing, §5.1 ----
   fuel: FuelName;
-  /** total emitted mixture concentration per second */
+  /**
+   * Density of the delivered mixture, relative to still air.
+   *
+   * The emitter is an inflow boundary rather than a deposit, so this is the state of the gas
+   * inside it, not a rate. 1 is atmospheric; above that is the deliberate over-fill the 2023 talk
+   * describes artists wanting, which expansion then resolves. How *much* fire there is comes from
+   * the emitter's geometry and exit speed, and its character from the pre-mixing ratio.
+   */
   sourceAmount: number;
   /** §5.1.1 — oxygen pre-mixing ratio, the inverse of the equivalence ratio */
   oxygenPremix: number;
@@ -107,6 +115,31 @@ export interface KoraParams {
   /** What a drag does to the selected primitive, on the desktop gizmo and in the headset alike. */
   gizmoMode: GizmoMode;
 
+  // ---- sparks (a particle system beside the grid, not part of it) ----
+  sparksEnabled: boolean;
+  /** population cap; spawning fills it as fast as the reaction zone allows */
+  sparkCount: number;
+  /** released heat a cell must exceed before it throws embers at all */
+  sparkSpawnHeat: number;
+  /** probability a well-burning cell throws an ember, per candidate test */
+  sparkSpawnRate: number;
+  /** isotropic kick at birth, m/s, on top of the local gas velocity */
+  sparkEjectSpeed: number;
+  sparkLife: number;
+  /** 1 / tau of the drag that pulls an ember onto the gas velocity */
+  sparkDrag: number;
+  /** grey-body cooling coefficient, 3 eps sigma / (rho c r) */
+  sparkCooling: number;
+  sparkSize: number;
+  /** metres of motion streak per m/s */
+  sparkStreak: number;
+  sparkIntensity: number;
+
+  // ---- backdrop ----
+  /** Image-based backdrop. Soot is dark grey and reads as nothing against an empty void. */
+  environment: EnvironmentName;
+  backgroundIntensity: number;
+
   // ---- diagnostics ----
   /** Floor grid, world origin and simulation bounds, drawn behind the volume. */
   showGrid: boolean;
@@ -126,7 +159,7 @@ export const defaultParams: KoraParams = {
   macCormack: true,
 
   fuel: 'propane',
-  sourceAmount: 2.2,
+  sourceAmount: 1.0,
   oxygenPremix: 0.35,
   sourceTemperature: 1400,
   sourceRadius: 0.11,
@@ -182,6 +215,21 @@ export const defaultParams: KoraParams = {
   // to see that the obstacles are part of the solve rather than drawn over it.
   obstacleCount: 1,
   gizmoMode: 'translate',
+
+  sparksEnabled: true,
+  sparkCount: 24000,
+  sparkSpawnHeat: 0.8,
+  sparkSpawnRate: 0.1,
+  sparkEjectSpeed: 0.4,
+  sparkLife: 1.8,
+  sparkDrag: 0.9,
+  sparkCooling: 8e-11,
+  sparkSize: 0.004,
+  sparkStreak: 0.008,
+  sparkIntensity: 5.0,
+
+  environment: 'dusk',
+  backgroundIntensity: DEFAULT_INTENSITY.dusk,
 
   showGrid: true,
   debugView: 'off',

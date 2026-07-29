@@ -100,6 +100,13 @@ export class KoraSolver {
   private readonly frameLabels: string[][] = [];
   private readonly initNodes: N[][] = [];
   private readonly endTextures: FrameStart[] = [];
+  /**
+   * The buffers that are live while `parity` holds each value, so a consumer outside the frame
+   * graph can read the state the last step left behind. A graph bakes in the textures it was
+   * built against, so anything sampling the solver has to be built twice and picked by parity —
+   * the same reason the frame itself is.
+   */
+  readonly state: FrameStart[] = [];
   private parity = 0;
   private elapsed = 0;
 
@@ -134,6 +141,7 @@ export class KoraSolver {
 
     for (const p of [0, 1]) {
       const start = this.captureStart();
+      this.state[p] = start;
       this.ctx.f = this.fields.view();
       this.initNodes[p] = this.buildInit(start);
       this.frames[p] = this.buildFrame();
@@ -456,6 +464,11 @@ export class KoraSolver {
   reset(): void {
     this.elapsed = 0;
     this.renderer.compute(this.initNodes[this.parity]);
+  }
+
+  /** Which entry of `state` is live right now. */
+  get currentParity(): number {
+    return this.parity;
   }
 
   /** Advances the simulation. Returns the timestep actually taken. */

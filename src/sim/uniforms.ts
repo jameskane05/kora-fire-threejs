@@ -114,10 +114,15 @@ export function createUniforms(params: KoraParams) {
 export type KoraUniforms = ReturnType<typeof createUniforms>;
 
 /**
- * §5.1.1 pre-mixing. The artist gives a total emitted mixture amount and an oxygen pre-mixing
- * ratio; the source node turns that into absolute concentrations. Oxygen arrives as air, so it
- * drags 79/21 parts nitrogen with it — which is why raising the pre-mix ratio at a fixed total
- * mixture *reduces* the emitted fuel, and yields the shorter, cleaner flames of Figure 10.
+ * §5.1.1 pre-mixing. The artist gives a total mixture density and an oxygen pre-mixing ratio; the
+ * source node turns that into absolute concentrations. Oxygen arrives as air, so it drags 79/21
+ * parts nitrogen with it — which is why raising the pre-mix ratio at a fixed total *reduces* the
+ * fuel, and yields the shorter, cleaner flames of Figure 10.
+ *
+ * The ratio is a fraction of the stoichiometric oxygen demand, so the mixture's equivalence ratio
+ * comes out at exactly 1 / oxygenPremixRatio. Since the emitter blends the voxel to this mixture
+ * rather than adding to the air already there, that ratio is what decides whether the flame runs
+ * rich enough to soot, and is the single most consequential control in the panel.
  */
 export function premix(totalAmount: number, oxygenPremixRatio: number, stoichO2: number) {
   const k = Math.max(oxygenPremixRatio, 0);

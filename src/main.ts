@@ -1,10 +1,12 @@
 import {
   ACESFilmicToneMapping,
-  Color,
   type Group,
   type Line,
+  LinearSRGBColorSpace,
+  NoToneMapping,
   PerspectiveCamera,
   RenderPipeline,
+  SRGBColorSpace,
   Scene,
   Vector3,
   WebGPURenderer,
@@ -26,6 +28,8 @@ import { createGui, refreshGui } from './ui/gui';
 import { PRESETS, applyPreset, type Preset } from './ui/presets';
 import { QUALITY, QUALITY_TIERS, applyQuality, type Quality } from './ui/quality';
 import { Obstacles, type GizmoMode } from './scene/Obstacles';
+import { Environment, DEFAULT_INTENSITY, type EnvironmentName } from './scene/Environment';
+import { Sparks } from './particles/Sparks';
 import type { ObstacleKind } from './sim/obstacles';
 import { Hands, previewHand } from './xr/Hands';
 import { ImmersiveMode } from './xr/ImmersiveMode';
@@ -73,12 +77,19 @@ async function main() {
   await renderer.init();
 
   const device = (renderer as unknown as { backend?: { device?: GPUDevice } }).backend?.device;
-  if (device) installGpuErrorReporter(device);
+  if (device) {
+    installGpuErrorReporter(device);
+    // A session that drops back to passthrough on its own has usually lost the device rather than
+    // hit a validation error, and nothing else reports that.
+    void device.lost.then((info) => {
+      console.error(`[kora] the GPU device was lost (${info.reason}): ${info.message}`);
+    });
+  }
 
   disarmTimestamps(renderer);
 
   const scene = new Scene();
-  scene.background = new Color(0x05060a);
+  const environment = new Environment(scene);
 
   const camera = new PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.05, 200);
   const controls = new OrbitControls(camera, renderer.domElement);
@@ -107,8 +118,32 @@ async function main() {
   // stay at life size, while the rig scales the domain down to something you can hold.
   const hands = new Hands(renderer, scene);
 
+  // Embers are their own solve reading the volume's output, which is why they are built from the
+  // solver rather than inside it. They share the flame's blackbody table so a spark leaving the
+  // fire is the same colour as the fire it left.
+  function makeSparks() {
+    return new Sparks(
+      {
+        render: solver.renderField,
+        solid: solver.fields.solid,
+        velocity: [solver.state[0].vel, solver.state[1].vel],
+        lut: volume.lut,
+      },
+      solver.uniforms,
+      solver.res,
+      params.domainSize,
+      Math.max(1, Math.round(params.sparkCount)),
+    );
+  }
+  let sparks = makeSparks();
+
   immersive.attach(volume.mesh);
+  immersive.attach(sparks.mesh);
   solver.reset();
+  sparks.reset(renderer);
+
+  environment.setIntensity(params.backgroundIntensity);
+  void environment.set(params.environment);
 
   let domainHelper = createDomainHelper(params.domainSize);
   domainHelper.visible = params.showGrid;
@@ -190,6 +225,8 @@ async function main() {
 
   function rebuild() {
     volume.mesh.removeFromParent();
+    sparks.mesh.removeFromParent();
+    sparks.dispose();
     solver.dispose();
 
     solver = new KoraSolver(renderer, params, noise);
@@ -197,8 +234,11 @@ async function main() {
       { field: solver.renderField, blur: solver.renderBlur, solid: solver.fields.solid },
       params.domainSize,
     );
+    sparks = makeSparks();
     immersive.attach(volume.mesh);
+    immersive.attach(sparks.mesh);
     solver.reset();
+    sparks.reset(renderer);
     probes = null;
 
     // The reference geometry is sized to the domain, so it is rebuilt rather than reused.
@@ -220,8 +260,26 @@ async function main() {
    * raymarching than a window. Anything above the immersive tier is stepped down for the
    * duration and put back on exit, since a fire that judders is worse than one with less detail.
    */
-  const IMMERSIVE_QUALITY: Quality = 'balanced';
+  const IMMERSIVE_QUALITY: Quality = 'performance';
   let qualityBeforeXR: Quality | null = null;
+
+  /**
+   * Session debug switches, as query parameters so a headset can be sent straight to a URL.
+   *
+   * `?bisect=1` draws the reference geometry only — see the note in the frame loop.
+   *
+   * `?flat=1` renders a session without tone mapping and in the working colour space. Both of
+   * those are what make three interpose an intermediate target and copy out of it: in a session
+   * that is a second full-size half-float array texture and a blit into the compositor's eye
+   * textures every frame, and it is the least travelled path in the whole stack. Turning them off
+   * has the scene drawn straight into the eye buffers. Colour will be wrong; that is not the point.
+   */
+  const flags = new URLSearchParams(location.search);
+  let bisect = flags.has('bisect');
+  const flatXR = flags.has('flat');
+  if (bisect || flatXR) {
+    console.info(`[kora/xr] debug flags: ${bisect ? 'bisect ' : ''}${flatXR ? 'flat' : ''}`.trim());
+  }
 
   function enterImmersive() {
     controls.enabled = false;
@@ -236,12 +294,26 @@ async function main() {
       refreshGui(gui);
       rebuild();
     }
+
+    if (flatXR) {
+      renderer.toneMapping = NoToneMapping;
+      renderer.outputColorSpace = LinearSRGBColorSpace;
+    }
+
+    // Read after the tier has settled: this is the only thing standing between the raymarcher and
+    // the headset's full recommended resolution, which is far more pixels than it can carry.
+    immersive.setLayerScale(QUALITY[params.quality].xrScale);
   }
 
   function exitImmersive() {
     controls.enabled = true;
     obstacles.setGizmoEnabled(true);
     applyPixelRatio(params.quality);
+
+    if (flatXR) {
+      renderer.toneMapping = ACESFilmicToneMapping;
+      renderer.outputColorSpace = SRGBColorSpace;
+    }
 
     if (qualityBeforeXR) {
       params = applyQuality(params, qualityBeforeXR);
@@ -342,6 +414,14 @@ async function main() {
         if (obstacles.selection !== null) obstacles.remove(obstacles.selection);
       },
       onGizmoMode: (mode: GizmoMode) => obstacles.setMode(mode),
+      onEnvironment: (name: EnvironmentName) => {
+        // The backdrops span a wide range of real exposures, so each carries its own starting
+        // brightness; without it, daylight arrives orders of magnitude above the flame.
+        params.backgroundIntensity = DEFAULT_INTENSITY[name];
+        environment.setIntensity(params.backgroundIntensity);
+        void environment.set(name);
+        refreshGui(gui);
+      },
     };
   }
 
@@ -364,6 +444,15 @@ async function main() {
     addObstacle: (kind: ObstacleKind = 'sphere') => addObstacle(kind),
     obstacles: () => obstacles,
     immersive: () => immersive,
+    xrStatus: () => {
+      const status = immersive.status();
+      console.table(status);
+      return status;
+    },
+    xrBisect: (on = true) => {
+      bisect = on;
+      return `session rendering ${on ? 'reference geometry only' : 'everything'}`;
+    },
     params: () => params,
     setDebugView: (v: KoraParams['debugView'], scale = 1) => {
       params.debugView = v;
@@ -377,7 +466,10 @@ async function main() {
     },
     // Refilling the domain only re-runs the init kernels; rebuilding tears down and recompiles
     // every compute graph, which is only needed when a parameter changes the graph's shape.
-    reset: () => solver.reset(),
+    reset: () => {
+      solver.reset();
+      sparks.reset(renderer);
+    },
     // The hand shader is only ever seen inside a headset; this puts one on screen, and frames it,
     // so it can be looked at without one.
     previewHand: async (handedness: 'left' | 'right' = 'right') => {
@@ -431,6 +523,44 @@ async function main() {
   let frames = 0;
   let fps = 0;
 
+  /**
+   * Renders a session frame, with the first few wrapped in a validation error scope.
+   *
+   * The session dies on its first rendered frame and leaves nothing behind: no uncaptured error,
+   * no lost device, not even the session's own `end` event. An error scope is the one report that
+   * cannot go missing, because it resolves against the work this call submitted rather than
+   * relying on a handler that may be torn down with the session.
+   */
+  let scoped = 0;
+
+  function renderXR() {
+    if (!device || scoped >= 3) {
+      renderer.render(scene, camera);
+      return;
+    }
+
+    const nth = ++scoped;
+    const started = performance.now();
+
+    device.pushErrorScope('validation');
+    try {
+      renderer.render(scene, camera);
+    } catch (error) {
+      console.error(`[kora] XR render ${nth} threw:`, error);
+    }
+    void device.popErrorScope().then((error) => {
+      if (error) console.error(`[kora] XR render ${nth} was invalid: ${error.message}`);
+      else console.info(`[kora/xr] render ${nth} validated clean`);
+    });
+
+    // The session stays open but stops asking for frames, which is what a compositor does while
+    // it waits on work that never finishes. This says whether the queue actually drained, and how
+    // long it took — a line that never arrives is a hung queue, and a slow one is a budget problem.
+    void device.queue.onSubmittedWorkDone().then(() => {
+      console.info(`[kora/xr] render ${nth} finished on the GPU after ${Math.round(performance.now() - started)} ms`);
+    });
+  }
+
   function animate(_time?: number, xrFrame?: XRFrame) {
     if (profiling) return;
 
@@ -448,20 +578,43 @@ async function main() {
 
     solver.params.bloom = params.bloom;
     bloomPass.strength.value = params.bloom;
+    environment.setIntensity(params.backgroundIntensity);
 
-    // Before the step, so the velocity a dragged primitive picked up this frame is the boundary
-    // flux the projection sees rather than one frame stale.
-    obstacles.update(dt);
-    solver.step(dt);
-    volume.update(params, frame++);
+    // With the bisect on, a session draws the reference geometry and nothing else: no solve, no
+    // particles, no raymarch. A session that stays open like that is one whose only problem is
+    // what the fire costs, which is a different repair from one whose plumbing is wrong.
+    const stripped = bisect && immersive.active;
+
+    if (!stripped) {
+      // Before the step, so the velocity a dragged primitive picked up this frame is the boundary
+      // flux the projection sees rather than one frame stale.
+      obstacles.update(dt);
+      solver.step(dt);
+      volume.update(params, frame++);
+
+      // After the step, so the embers spawn from the reaction zone and ride the velocity field
+      // this frame actually produced rather than last frame's.
+      sparks.update(params);
+      if (params.sparksEnabled) sparks.step(renderer, solver.currentParity, dt, frame);
+    }
+
+    volume.mesh.visible = !stripped;
+    sparks.mesh.visible = !stripped && params.sparksEnabled;
 
     if (immersive.active) {
       immersive.update(xrFrame ?? null, dt);
       hands.update();
-      // The bloom pass composites through a screen-space render target, which is not something
-      // the XR projection layer's per-eye array texture will accept. In a session the volume
-      // goes straight to the eye buffers and loses its glow.
-      renderer.render(scene, camera);
+
+      // `rendering`, not `active`: the first frames of a session go by before the renderer is
+      // bound and its eye buffers are sized, and drawing into those is drawing into nothing.
+      // Skipping the frame entirely is the point — the desktop path would composite to the canvas
+      // while the renderer is pointed at the headset.
+      if (immersive.rendering) {
+        // The bloom pass composites through a screen-space render target, which is not something
+        // the XR projection layer's per-eye array texture will accept. In a session the volume
+        // goes straight to the eye buffers and loses its glow.
+        renderXR();
+      }
     } else {
       controls.update();
       post.render();

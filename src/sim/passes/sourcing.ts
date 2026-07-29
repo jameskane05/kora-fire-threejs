@@ -63,23 +63,39 @@ export function sourcingPass(ctx: Ctx, obstacles: number): N {
     const voxelOf = (o: N) => vec3(c).add(o);
     const mask = sourceMask(u, voxelOf(vec3(0.5))).toVar();
 
-    // Continuous emission is a rate; the detonation charge is an amount injected whole. Keeping
-    // them separate is what lets an emitter that is switched off still be detonated.
-    const emitted = u.sourceMix
-      .mul(u.dt)
-      .add(u.detonationMix.mul(u.sourceImpulse))
-      .mul(mask)
-      .toVar();
-
-    // Temperature and velocity are only stamped while the emitter is actually delivering
-    // something. Keying them off the geometric mask alone leaves an idle emitter pinning its
-    // region to the source temperature forever, and — worse for a detonation — pinning the
-    // velocity there to the source velocity, holding the blast still as it tries to expand.
+    // Temperature, velocity and now composition are only stamped while the emitter is actually
+    // delivering something. Keying them off the geometric mask alone leaves an idle emitter
+    // pinning its region to the source temperature forever, and — worse for a detonation —
+    // pinning the velocity there to the source velocity, holding the blast still as it expands.
     const stamp = mask.mul(clamp(u.sourceGate.add(u.sourceImpulse), 0.0, 1.0)).toVar();
 
-    fuel.addAssign(emitted.x);
-    const oxygen = chem.y.add(emitted.y).toVar();
-    nitrogen.addAssign(emitted.z);
+    // Continuous emission displaces what is in the voxel instead of being deposited on top of it.
+    //
+    // Adding to the cell was wrong, and wrong in a way that quietly disabled half the paper: the
+    // ambient air stayed where it was, so an emitter voxel was 21% oxygen plus a trace of fuel and
+    // the mixture could never run rich. Soot only nucleates from fuel left over once oxygen is
+    // locally spent (§4.5.1), so nothing sooted, ever — no smoke in any preset at any setting.
+    //
+    // Displacement is also what gives §5.1.1's pre-mixing ratio the meaning the paper describes.
+    // The premix is a fraction of the stoichiometric oxygen demand, so an emitter blended to the
+    // mixture sits at an equivalence ratio of exactly 1 / oxygenPremix: 0.85 is a near-clean
+    // premixed flame, 0.04 is the heavily sooting flamethrower. That single ratio deciding between
+    // them is Figure 10, and it could not do it while the voxel was full of air regardless.
+    //
+    // The total need not come to atmospheric. `sourceAmount` is the density of the delivered gas
+    // relative to still air, and a value above one is the over-filling the 2023 talk singles out
+    // as the thing artists kept asking for — the expansion step resolves it over the steps after.
+    const supplied = mix(vec4(fuel, chem.y, nitrogen, chem.w), u.sourceMix, stamp).toVar();
+
+    // The charge stays additive. It is an amount injected whole rather than a flow, which is the
+    // §4.4 explosion case: stamp a large quantity into a volume at once and let expansion sort out
+    // the pressure afterwards. Blending it in would cap it at the mixture and lose the over-fill.
+    supplied.addAssign(u.detonationMix.mul(u.sourceImpulse).mul(mask));
+
+    fuel.assign(supplied.x);
+    const oxygen = supplied.y.toVar();
+    nitrogen.assign(supplied.z);
+    const product = supplied.w.toVar();
 
     // The emitter is an inflow boundary, so inside it the temperature is the source temperature
     // rather than anything the solver arrived at. Taking a max() here instead makes it a one-way
@@ -108,7 +124,7 @@ export function sourcingPass(ctx: Ctx, obstacles: number): N {
     // accumulate. The velocity boundary keeps flow from entering, but advection and diffusion
     // are not boundary-aware and would otherwise let heat and soot seep in and glow there.
     // Doing it here, in the pass that already holds all three buffers, costs no extra pass.
-    const chemOut = vec4(fuel, oxygen, nitrogen, chem.w).toVar();
+    const chemOut = vec4(fuel, oxygen, nitrogen, product).toVar();
     const auxOut = vec4(soot, temperature, aux.z, aux.w).toVar();
     const velOut = vec4(newVel, 0.0).toVar();
 

@@ -34,7 +34,7 @@ import {
   Fn,
   If,
   Loop,
-  cameraPosition,
+  cameraWorldMatrix,
   clamp,
   exp,
   float,
@@ -42,9 +42,10 @@ import {
   max,
   min,
   mix,
+  modelWorldMatrixInverse,
   normalize,
   oneMinus,
-  positionWorld,
+  positionLocal,
   pow,
   screenCoordinate,
   texture,
@@ -175,8 +176,17 @@ export class VolumeRenderer {
     };
 
     return Fn(() => {
-      const origin = cameraPosition;
-      const dir = normalize(positionWorld.sub(origin));
+      // The march runs in object space, where the domain bounds are fixed and a step of `ds` is a
+      // step of `ds` simulated metres. In a session the mesh hangs off a rig that scales the
+      // domain down and swings it around, so a world-space ray would miss the box entirely.
+      //
+      // The camera comes from the translation column of its world matrix rather than TSL's
+      // `cameraPosition`: under an XR ArrayCamera the latter backs itself with a uniform array
+      // whose render-update callback three invokes frameless during setup, which throws. Both
+      // resolve per-eye.
+      const cameraWorld: N = (cameraWorldMatrix as N)[3];
+      const origin = modelWorldMatrixInverse.mul(cameraWorld).xyz;
+      const dir = normalize(positionLocal.sub(origin));
       const invDir = vec3(1.0).div(dir);
 
       const hit = intersectBox(origin, invDir);
@@ -285,8 +295,15 @@ export class VolumeRenderer {
         // medium in its own right rather than a glow painted onto smoke. Extinction has to
         // include it: a clean premixed flame makes no soot, and on soot alone it would composite
         // at zero opacity and vanish however bright its emission.
-        const sigma = shadedSoot.mul(u.sootDensity).add(flameAlpha.mul(u.flameIntensity));
+        const sootSigma = shadedSoot.mul(u.sootDensity);
+        const sigma = sootSigma.add(flameAlpha.mul(u.flameIntensity));
         const alpha = oneMinus(exp(sigma.negate().mul(ds)));
+
+        // What fraction of the extinction here is soot rather than reaction zone. The in-scatter
+        // below is light bouncing off smoke particles, so it has to be weighted by this: applied
+        // to the whole alpha it also washes over a clean, soot-free flame, which only ever makes
+        // the fire brighter and never reads as smoke.
+        const sootShare = sootSigma.div(max(sigma, float(1e-6)));
 
         // Cheap self-shadowing: the blurred soot doubles as an occlusion estimate, so deep
         // smoke sits in shadow without paying for a per-step shadow ray.
@@ -296,7 +313,9 @@ export class VolumeRenderer {
           .mul(u.smokeAmbient)
           .mul(u.sootAlbedo);
 
-        radiance.addAssign(transmittance.mul(emission.mul(ds).add(scattered.mul(alpha))));
+        radiance.addAssign(
+          transmittance.mul(emission.mul(ds).add(scattered.mul(alpha).mul(sootShare))),
+        );
         transmittance.mulAssign(oneMinus(alpha));
 
         t.addAssign(ds);

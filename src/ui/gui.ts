@@ -3,6 +3,7 @@ import { DEBUG_CHANNELS } from '../render/VolumeRenderer';
 import { FUELS } from '../sim/constants';
 import type { KoraParams } from '../sim/params';
 import { MAX_OBSTACLES, type GizmoMode, type ObstacleKind } from '../sim/obstacles';
+import { ENVIRONMENTS, type EnvironmentName } from '../scene/Environment';
 import { PRESETS, type Preset } from './presets';
 import { QUALITY, QUALITY_TIERS, type Quality } from './quality';
 
@@ -24,6 +25,7 @@ export interface GuiCallbacks {
   onAddObstacle(kind: ObstacleKind): void;
   onRemoveObstacle(): void;
   onGizmoMode(mode: GizmoMode): void;
+  onEnvironment(name: EnvironmentName): void;
 }
 
 export function createGui(params: KoraParams, cb: GuiCallbacks): GUI {
@@ -64,9 +66,14 @@ export function createGui(params: KoraParams, cb: GuiCallbacks): GUI {
     .add(params, 'fuel', Object.keys(FUELS))
     .name('fuel')
     .onChange(() => cb.onReset());
-  src.add(params, 'sourceAmount', 0, 12, 0.05).name('mixture amount');
+  // Density of the gas in the emitter, not a rate: 1 is atmospheric, above is a deliberate
+  // over-fill for expansion to resolve. The pre-mix ratio below is what decides sooty versus clean.
+  src.add(params, 'sourceAmount', 0, 4, 0.05).name('mixture density (1 = air)');
   src.add(params, 'detonationCharge', 0, 30, 0.1).name('detonation charge');
-  src.add(params, 'oxygenPremix', 0, 1.2, 0.01).name('oxygen pre-mix (1/phi)');
+  // Floored rather than allowed to zero: the emitter is blended to this mixture, so below about
+  // 0.05 the jet is so rich that it has cooled past the ignition temperature by the time it mixes
+  // down to a flammable ratio, and simply never lights.
+  src.add(params, 'oxygenPremix', 0.05, 1.2, 0.01).name('oxygen pre-mix (1/phi)');
   src.add(params, 'sourceTemperature', 400, 3000, 10).name('temperature K');
   src.add(params, 'sourceRadius', 0.01, 1.0, 0.005).name('radius m');
   src.add(params, 'sourceLength', 0, 3, 0.01).name('capsule length m');
@@ -147,6 +154,14 @@ export function createGui(params: KoraParams, cb: GuiCallbacks): GUI {
   render.add(params, 'raymarchSteps', 32, 256, 1).name('raymarch steps');
   render.add(params, 'showFlameFront').name('tint by equivalence ratio');
 
+  // Backdrops. Not lighting — nothing here is lit — but soot is dark grey and simply does not
+  // read against an empty void, so the smoke half of the sim is invisible without one.
+  render
+    .add(params, 'environment', [...ENVIRONMENTS])
+    .name('backdrop')
+    .onChange((name: EnvironmentName) => cb.onEnvironment(name));
+  render.add(params, 'backgroundIntensity', 0, 3, 0.01).name('backdrop brightness').listen();
+
   // ---- solver ---------------------------------------------------------------------------------
   const solver = gui.addFolder('Solver');
   solver
@@ -190,6 +205,28 @@ export function createGui(params: KoraParams, cb: GuiCallbacks): GUI {
     .name('gizmo (W / E / R)')
     .onChange((m: GizmoMode) => cb.onGizmoMode(m));
   solids.close();
+
+  // ---- sparks ----------------------------------------------------------------------------------
+  // Both papers keep sparks off the grid and in a particle system, so this is a separate solve
+  // that samples the volume rather than a channel of it. Changing the population reallocates the
+  // buffers, hence the structural rebuild.
+  const sparks = gui.addFolder('Sparks & embers');
+  sparks.add(params, 'sparksEnabled').name('enabled');
+  sparks
+    .add(params, 'sparkCount', 0, 80000, 1000)
+    .name('population cap')
+    .onFinishChange(() => cb.onStructuralChange());
+  sparks.add(params, 'sparkSpawnRate', 0, 1, 0.01).name('spawn rate');
+  sparks.add(params, 'sparkSpawnHeat', 0, 6, 0.05).name('heat floor');
+  sparks.add(params, 'sparkEjectSpeed', 0, 5, 0.05).name('ejection speed (m/s)');
+  sparks.add(params, 'sparkLife', 0.2, 10, 0.1).name('lifetime (s)');
+  // Low is a heavy cinder that arcs over, high is a mote that rides the plume out of the top.
+  sparks.add(params, 'sparkDrag', 0.1, 8, 0.05).name('drag rate (1/s)');
+  sparks.add(params, 'sparkCooling', 0, 6e-10, 1e-11).name('radiative cooling');
+  sparks.add(params, 'sparkSize', 0.001, 0.06, 0.001).name('size (m)');
+  sparks.add(params, 'sparkStreak', 0, 0.06, 0.001).name('motion streak');
+  sparks.add(params, 'sparkIntensity', 0, 6, 0.05).name('intensity');
+  sparks.close();
 
   // ---- diagnostics -----------------------------------------------------------------------------
   const debug = gui.addFolder('Diagnostics');

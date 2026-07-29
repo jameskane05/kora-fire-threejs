@@ -58,6 +58,70 @@ const MAX_SPIN = 6.0;
 /** How far the box may be tipped, so it can never end up upside down. */
 const PITCH_LIMIT = Math.PI * 0.35;
 
+/** Frame counts that report in, so a loop that stalls shows up as a line that never arrives. */
+const FRAME_REPORTS = new Set([1, 2, 3, 5, 10, 30, 120]);
+
+/**
+ * Shrinks the XR projection layer, which three's WebGPU path otherwise leaves at full size.
+ *
+ * On the WebGL path three passes its framebuffer scale factor into `createProjectionLayer`; the
+ * WebGPU path passes only the formats, so the layer comes back at whatever the compositor
+ * recommends. On a Vision Pro that is 4851x3887 per eye — around 38 megapixels of raymarching a
+ * frame, backed by an eye buffer and a half-gigabyte float intermediate for tone mapping. The
+ * session stays open and keeps handing out poses, but nothing is ever finished and presented, so
+ * the passthrough environment simply never goes away.
+ *
+ * A layer cannot be resized once built and three exposes no hook, so the scale is folded into the
+ * call on its way through. `setFramebufferScaleFactor` is the equivalent knob on the WebGL path.
+ */
+let layerScale = 1;
+
+/**
+ * Stops three setting a viewport or scissor rect for the duration of a session.
+ *
+ * visionOS reads any explicit `setScissorRect` — even one covering the whole attachment — as a
+ * hint about where in the eye display the image belongs, and clips to it; `setViewport` behaves
+ * the same way. That is WebKit bug 315274, and it renders the scene into a sub-rectangle of each
+ * eye. PlayCanvas hit it too and fixed it by simply not making the calls.
+ *
+ * A render pass defaults to the full attachment, which is what the compositor wants, and since
+ * each eye is its own array layer there is no sub-rectangle to select in the first place. three
+ * additionally scales the viewport by the renderer's pixel ratio, which on the WebGPU path is
+ * never reset to 1 the way it is for WebGL — so at any tier above `performance` the viewport
+ * came out larger than the attachment as well.
+ */
+let suppressPassRects = false;
+
+function installPassRectSuppression(): void {
+  type Encoder = { prototype: Record<string, unknown> };
+  const proto = (globalThis as { GPURenderPassEncoder?: Encoder }).GPURenderPassEncoder?.prototype;
+  if (!proto || proto.koraRectsSuppressed) return;
+
+  for (const name of ['setViewport', 'setScissorRect'] as const) {
+    const original = proto[name] as (...args: number[]) => void;
+    proto[name] = function (this: unknown, ...args: number[]) {
+      if (suppressPassRects) return;
+      original.apply(this, args);
+    };
+  }
+  proto.koraRectsSuppressed = true;
+}
+
+function installLayerScale(): boolean {
+  type Binding = { prototype: Record<string, unknown> };
+  const proto = (globalThis as { XRGPUBinding?: Binding }).XRGPUBinding?.prototype;
+  if (!proto) return false;
+  if (proto.koraScaled) return true;
+
+  const create = proto.createProjectionLayer as (init: object) => unknown;
+  proto.createProjectionLayer = function (this: unknown, init: object) {
+    // Ours first so an explicit scaleFactor from a future three would still win.
+    return create.call(this, { scaleFactor: layerScale, ...init });
+  };
+  proto.koraScaled = true;
+  return true;
+}
+
 export interface ImmersiveCallbacks {
   onEnter(): void;
   onExit(): void;
@@ -137,6 +201,14 @@ export class ImmersiveMode {
   /** Reference-space furniture: the mode buttons. Added to the scene, not to the rig. */
   readonly hud = new Group();
 
+  /**
+   * Dumps each eye's sub-image on the second frame of the next session.
+   *
+   * Off by default: it calls into the binding on the same frame as the first render, which is a
+   * poor thing to have in the picture when that frame is the one under suspicion.
+   */
+  debugViews = false;
+
   private readonly drags = new Map<XRInputSource, Drag>();
   private readonly velocity = { yaw: 0, pitch: 0 };
   private readonly direction = new Vector3();
@@ -152,6 +224,12 @@ export class ImmersiveMode {
   private domainSize = 1;
   private button: HTMLButtonElement | null = null;
   private session: XRSession | null = null;
+  private presenting = false;
+  private framesSeen = 0;
+  private sessionStart = 0;
+  private layerScale = 0.5;
+  private targetReady = false;
+  private pixelRatioBeforeXR = 1;
 
   constructor(
     private readonly renderer: Renderer,
@@ -183,6 +261,200 @@ export class ImmersiveMode {
 
   get active(): boolean {
     return this.session !== null;
+  }
+
+  /** True only once the renderer is bound to the headset *and* has somewhere real to draw. */
+  get rendering(): boolean {
+    return this.presenting && this.targetReady;
+  }
+
+  /**
+   * Fraction of the compositor's recommended eye resolution to render at. Takes effect on the
+   * next session, since a projection layer is fixed in size once it exists.
+   */
+  setLayerScale(scale: number): void {
+    this.layerScale = Math.max(0.1, Math.min(1, scale));
+  }
+
+  /** The layer's per-eye texture, read off three's handle, to confirm the scale actually took. */
+  private layerSize(): string {
+    const xr = this.renderer.xr as unknown as {
+      _glProjLayer?: { textureWidth: number; textureHeight: number };
+      _webgpuBinding?: { nativeProjectionScaleFactor?: number };
+    };
+    const layer = xr._glProjLayer;
+    const native = xr._webgpuBinding?.nativeProjectionScaleFactor;
+    const size = layer ? `${layer.textureWidth}x${layer.textureHeight}` : 'none';
+    return native === undefined ? size : `${size} (native x${native})`;
+  }
+
+  /**
+   * Gives three's XR render target the dimensions WebKit declines to report.
+   *
+   * `_initWebGPUSession` sizes the target straight from the projection layer's `textureWidth` and
+   * `textureHeight`, and on visionOS a layer created through `XRGPUBinding` reports both as zero.
+   * The target is therefore 0x0, as is the half-float buffer the tone mapper sizes from it, and
+   * the session renders into nothing: no frame is ever presented, the compositor stops asking for
+   * more, and the passthrough environment simply stays where it is.
+   *
+   * The true size is on the `GPUTexture` the compositor hands back each frame, which three has
+   * already registered against the target by the time the frame loop reaches us. Resizing clears
+   * the backend's record of that registration, so the frame this happens on is deliberately not
+   * rendered — from the next one the size matches, nothing is disposed, and the eye textures are
+   * drawn into as intended.
+   */
+  private sizeXRTarget(): boolean {
+    type Sized = { width: number; height: number };
+    type Target = Sized & {
+      depth: number;
+      texture: object;
+      setSize(w: number, h: number, d?: number): void;
+    };
+
+    const target = (this.renderer.xr as unknown as { _xrRenderTarget?: Target })._xrRenderTarget;
+    if (!target) return false;
+    if (target.width > 0 && target.height > 0) return true;
+
+    const backend = (
+      this.renderer as unknown as {
+        backend?: { get?(object: object): { texture?: Sized } | undefined };
+      }
+    ).backend;
+
+    const texture = backend?.get?.(target.texture)?.texture;
+    if (!texture?.width || !texture.height) return false;
+
+    // Width and height only. The texture's `depthOrArrayLayers` reads 1 here, but the view
+    // descriptors the compositor hands back select `baseArrayLayer` 0 and 1, so it is really the
+    // two-layer array three built the target for. Believing the field collapses the target to a
+    // single layer, which drops the second eye and turns off the array depth buffer with it.
+    target.setSize(texture.width, texture.height, target.depth);
+    this.log(`sized the XR target to ${texture.width}x${texture.height}, drawing from next frame`);
+    return false;
+  }
+
+  /**
+   * Everything the compositor says about each eye, once.
+   *
+   * The layout is only discoverable here, and on visionOS several of the fields disagree with each
+   * other: the viewport is reported in recommended-resolution space rather than the texture's, the
+   * texture claims a single array layer, and the view descriptors nonetheless select layers 0 and
+   * 1. The descriptors are the ones telling the truth.
+   */
+  private dumpSubImages(frame: XRFrame, referenceSpace: XRReferenceSpace): void {
+    type SubImage = {
+      viewport: { x: number; y: number; width: number; height: number };
+      colorTexture: { width: number; height: number; depthOrArrayLayers: number; format: string };
+      getViewDescriptor?(): object;
+    };
+    const xr = this.renderer.xr as unknown as {
+      getWebGPUBinding?(): { getViewSubImage(layer: object, view: XRView): SubImage } | null;
+      _glProjLayer?: object;
+    };
+
+    const binding = xr.getWebGPUBinding?.();
+    const layer = xr._glProjLayer;
+    const pose = frame.getViewerPose(referenceSpace);
+    if (!binding || !layer || !pose) return;
+
+    let shared: object | null = null;
+
+    pose.views.forEach((view, i) => {
+      const sub = binding.getViewSubImage(layer, view);
+      const { viewport: v, colorTexture: t } = sub;
+      const descriptor = sub.getViewDescriptor?.();
+      if (i === 0) shared = t;
+
+      this.log(
+        `view ${i} | viewport ${v.x},${v.y} ${v.width}x${v.height} | ` +
+          `colour ${t.width}x${t.height}x${t.depthOrArrayLayers} ${t.format} | ` +
+          `sameTexture ${t === shared} | descriptor ${descriptor ? JSON.stringify(descriptor) : 'none'}`,
+      );
+    });
+  }
+
+  /**
+   * Keeps each eye's viewport inside the texture it is drawn into.
+   *
+   * visionOS reports a sub-image viewport of the recommended resolution while handing back a much
+   * smaller texture, and three copies that viewport onto the sub-cameras verbatim. Setting a
+   * viewport larger than its attachment is a validation error, so the frame is thrown away.
+   */
+  private clampViewports(): void {
+    const target = (
+      this.renderer.xr as unknown as { _xrRenderTarget?: { width: number; height: number } }
+    )._xrRenderTarget;
+    if (!target || target.width === 0) return;
+
+    const xrCamera = this.renderer.xr.getCamera() as unknown as {
+      cameras?: { viewport?: { x: number; y: number; width: number; height: number } }[];
+    };
+
+    for (const sub of xrCamera.cameras ?? []) {
+      const v = sub.viewport;
+      if (!v) continue;
+      v.x = Math.max(0, Math.min(v.x, target.width));
+      v.y = Math.max(0, Math.min(v.y, target.height));
+      v.width = Math.min(v.width, target.width - v.x);
+      v.height = Math.min(v.height, target.height - v.y);
+    }
+  }
+
+  /** What three is actually rendering into, which is the number that was silently zero. */
+  private targetSize(): string {
+    const target = (
+      this.renderer.xr as unknown as {
+        _xrRenderTarget?: { width: number; height: number; depth: number };
+      }
+    )._xrRenderTarget;
+    return target ? `${target.width}x${target.height}x${target.depth}` : 'none';
+  }
+
+  /**
+   * Asks the compositor to hand back a smaller slice of the layer to draw into.
+   *
+   * The second, independent way to cut pixels, and the one that does not care whether the layer
+   * was created at a sane size: the texture stays as large as it was, but only the requested
+   * fraction of it is rendered and sampled. It applies from the following frame, which is why it
+   * is re-asked every frame rather than set once.
+   */
+  private requestViewportScale(frame: XRFrame, referenceSpace: XRReferenceSpace): void {
+    const pose = frame.getViewerPose(referenceSpace);
+    if (!pose) return;
+
+    for (const view of pose.views) {
+      const scalable = view as unknown as { requestViewportScale?: (scale: number) => void };
+      scalable.requestViewportScale?.(this.layerScale);
+    }
+  }
+
+  /**
+   * Every step between pressing the button and the first stereo frame, on one line each.
+   *
+   * A headset that shows nothing gives you no way to tell a session that never opened from one
+   * that opened and drew an empty frame, and the two have nothing in common to fix. There are
+   * only a handful of these and none repeat, so they cost nothing to leave in.
+   */
+  private log(message: string, detail?: unknown): void {
+    if (detail === undefined) console.info(`[kora/xr] ${message}`);
+    else console.info(`[kora/xr] ${message}`, detail);
+  }
+
+  /** A snapshot of everything entry depends on, for asking "why is the button doing nothing". */
+  status(): Record<string, unknown> {
+    const xr = this.renderer.xr as unknown as { isPresenting?: boolean };
+    return {
+      hasNavigatorXR: Boolean(navigator.xr),
+      hasXRGPUBinding: typeof (globalThis as { XRGPUBinding?: unknown }).XRGPUBinding !== 'undefined',
+      buttonHidden: this.button?.hidden ?? 'no button',
+      buttonDisabled: this.button?.disabled ?? 'no button',
+      buttonText: this.button?.textContent ?? 'no button',
+      session: this.session !== null,
+      enabledFeatures: this.session ? [...(this.session.enabledFeatures ?? [])] : null,
+      rendererPresenting: xr.isPresenting ?? false,
+      referenceSpace: Boolean(this.renderer.xr.getReferenceSpace()),
+      framesSeen: this.framesSeen,
+    };
   }
 
   /** Reparents an object into the rotating group. */
@@ -227,9 +499,11 @@ export class ImmersiveMode {
     let supported = false;
     try {
       supported = await navigator.xr.isSessionSupported('immersive-vr');
-    } catch {
+    } catch (error) {
+      this.log('isSessionSupported threw; leaving the button hidden', error);
       return;
     }
+    this.log('immersive-vr supported', supported);
     if (!supported) return;
 
     button.hidden = false;
@@ -255,6 +529,7 @@ export class ImmersiveMode {
 
     if (!navigator.xr || !this.button) return;
     this.button.disabled = true;
+    this.log('requesting a session');
 
     try {
       const session = await navigator.xr.requestSession('immersive-vr', {
@@ -263,8 +538,16 @@ export class ImmersiveMode {
         // updateRenderState, so `layers` has to be asked for even though it looks incidental.
         optionalFeatures: ['local-floor', 'bounded-floor', 'layers', 'hand-tracking'],
       });
+      this.log('session granted', [...(session.enabledFeatures ?? [])]);
       await this.begin(session);
     } catch (error) {
+      // Leaving `session` set here would strand the frame loop on its XR branch with no session
+      // behind it, so the page carries on running but stops drawing what it used to.
+      this.session = null;
+      this.presenting = false;
+      this.targetReady = false;
+      suppressPassRects = false;
+      this.renderer.setPixelRatio(this.pixelRatioBeforeXR);
       this.button.disabled = false;
       this.button.textContent = 'Enter VR';
       console.error('[kora] could not start an immersive session:', error);
@@ -273,6 +556,8 @@ export class ImmersiveMode {
 
   private async begin(session: XRSession): Promise<void> {
     this.session = session;
+    this.framesSeen = 0;
+    this.targetReady = false;
 
     session.addEventListener('end', () => this.end());
     session.addEventListener('selectstart', this.onSelectStart);
@@ -282,11 +567,30 @@ export class ImmersiveMode {
       session.enabledFeatures?.includes('local-floor') ? 'local-floor' : 'local',
     );
 
+    // onEnter picks the immersive quality tier, which is where the layer scale comes from, so the
+    // shim has to go in after it and before three builds the layer inside setSession.
     this.callbacks.onEnter();
     this.layout();
     this.panel?.setVisible(true);
 
+    layerScale = this.layerScale;
+    const scaled = installLayerScale();
+
+    installPassRectSuppression();
+    suppressPassRects = true;
+
+    // What three's WebGL paths do inside setSession and its WebGPU path forgets. Nothing about a
+    // projection layer is measured in CSS pixels, and three scales the eye viewport by this.
+    this.pixelRatioBeforeXR = this.renderer.getPixelRatio();
+    this.renderer.setPixelRatio(1);
+
     await this.renderer.xr.setSession(session);
+    this.presenting = true;
+    this.sessionStart = performance.now();
+    this.log(
+      `renderer bound | requested scale ${layerScale} | shim ${scaled ? 'installed' : 'FAILED'} | ` +
+        `layer ${this.layerSize()}`,
+    );
 
     if (this.button) {
       this.button.disabled = false;
@@ -295,7 +599,12 @@ export class ImmersiveMode {
   }
 
   private end(): void {
+    this.log('session ended', { framesSeen: this.framesSeen });
     this.session = null;
+    this.presenting = false;
+    this.targetReady = false;
+    suppressPassRects = false;
+    this.renderer.setPixelRatio(this.pixelRatioBeforeXR);
     this.drags.clear();
     this.grab.end();
     this.velocity.yaw = 0;
@@ -328,6 +637,48 @@ export class ImmersiveMode {
     this.ray.orientation.set(orientation.x, orientation.y, orientation.z, orientation.w);
     this.ray.direction.set(0, 0, -1).applyQuaternion(this.ray.orientation);
     return true;
+  }
+
+  /**
+   * How the session is getting on, at a few frame counts.
+   *
+   * The mean frame time is the useful number here: a headset that shows nothing because the frame
+   * is too expensive to finish and one that shows nothing because it is drawing an empty scene
+   * look identical from the outside, and this is what tells them apart.
+   */
+  private reportFrame(frame: XRFrame, referenceSpace: XRReferenceSpace | null): void {
+    const elapsed = performance.now() - this.sessionStart;
+    const pose = referenceSpace ? frame.getViewerPose(referenceSpace) : null;
+    const xrCamera = this.renderer.xr.getCamera() as unknown as {
+      cameras?: { viewport?: { width: number; height: number } }[];
+    };
+    const eye = xrCamera.cameras?.[0]?.viewport;
+
+    // The runtime's projection is an asymmetric frustum, and the aspect it implies is the aspect
+    // it expects to be rendered into. If it disagrees with the viewport we ended up with, the
+    // image is stretched — which is a different complaint from the session dying.
+    const p = pose?.views[0]?.projectionMatrix;
+    const projAspect = p && p[0] !== 0 ? (p[5] / p[0]).toFixed(3) : '?';
+    const eyeAspect = eye && eye.height !== 0 ? (eye.width / eye.height).toFixed(3) : '?';
+
+    // One flat string rather than an object: Safari collapses objects in the console and hides
+    // whichever field turns out to matter.
+    // A WebXR session whose render state ends up with no baseLayer and an empty layer list stops
+    // running its frame loop, while staying perfectly alive. `updateRenderState` applies a frame
+    // or two after the call, which would give exactly the handful of frames we get.
+    const state = this.session?.renderState as
+      | { baseLayer?: object | null; layers?: readonly object[] }
+      | undefined;
+    const layers = state?.layers === undefined ? 'unsupported' : String(state.layers.length);
+
+    this.log(
+      `frame ${this.framesSeen} | ${Math.round(elapsed / this.framesSeen)} ms/frame | ` +
+        `layers ${layers} | baseLayer ${state?.baseLayer ? 'yes' : 'no'} | ` +
+        `pose ${pose ? 'yes' : 'no'} | views ${pose?.views.length ?? 0} | ` +
+        `eye ${eye ? `${Math.round(eye.width)}x${Math.round(eye.height)}` : 'none'} ` +
+        `(aspect ${eyeAspect} vs projection ${projAspect}) | ` +
+        `layer ${this.layerSize()} | target ${this.targetSize()}`,
+    );
   }
 
   /** The nearest of `targets` along the current ray, or null. */
@@ -419,6 +770,17 @@ export class ImmersiveMode {
     if (!this.session) return;
 
     const referenceSpace = this.renderer.xr.getReferenceSpace();
+
+    if (frame) {
+      this.framesSeen++;
+      this.targetReady = this.sizeXRTarget();
+      this.clampViewports();
+      if (referenceSpace) this.requestViewportScale(frame, referenceSpace);
+      if (this.debugViews && referenceSpace && this.framesSeen === 2) {
+        this.dumpSubImages(frame, referenceSpace);
+      }
+      if (FRAME_REPORTS.has(this.framesSeen)) this.reportFrame(frame, referenceSpace);
+    }
 
     if (frame && referenceSpace) {
       for (const drag of this.drags.values()) {

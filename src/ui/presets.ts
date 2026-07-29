@@ -23,7 +23,7 @@ export const PRESETS: Preset[] = [
     params: {
       fuel: 'propane',
       domainSize: 2.0,
-      sourceAmount: 1.6,
+      sourceAmount: 1.0,
       oxygenPremix: 0.3,
       sourceRadius: 0.06,
       sourceSpeed: 1.6,
@@ -53,7 +53,7 @@ export const PRESETS: Preset[] = [
     params: {
       fuel: 'methane',
       domainSize: 3.0,
-      sourceAmount: 2.4,
+      sourceAmount: 1.0,
       oxygenPremix: 0.85,
       sourceRadius: 0.05,
       sourceLength: 1.2,
@@ -77,8 +77,11 @@ export const PRESETS: Preset[] = [
     params: {
       fuel: 'acetylene',
       domainSize: 5.0,
-      sourceAmount: 5.0,
-      oxygenPremix: 0.12,
+      sourceAmount: 1.4,
+      // phi ~ 4.5. Rich enough to soot heavily, but not so rich that the shell where the jet
+      // mixes down to the flammability limit has cooled below the ignition temperature on the way
+      // — past that point the jet simply never lights.
+      oxygenPremix: 0.22,
       sourceRadius: 0.13,
       sourceLength: 0.25,
       sourceDirection: new Vector3(1, 0.22, 0),
@@ -135,7 +138,7 @@ export const PRESETS: Preset[] = [
     params: {
       fuel: 'diesel',
       domainSize: 7.0,
-      sourceAmount: 4.5,
+      sourceAmount: 1.2,
       oxygenPremix: 0.28,
       sourceRadius: 0.55,
       sourceLength: 0,
@@ -165,8 +168,10 @@ export const PRESETS: Preset[] = [
     params: {
       fuel: 'propane',
       domainSize: 3.0,
-      sourceAmount: 3.6,
-      oxygenPremix: 0.04,
+      sourceAmount: 1.0,
+      // phi ~ 5.6: starved, so the reaction is confined to a thin sheath at the mixing layer and
+      // pulses as fresh air is entrained, which is the whole point of this preset.
+      oxygenPremix: 0.18,
       sourceRadius: 0.14,
       sourceLength: 0,
       sourceSpeed: 2.2,
@@ -194,6 +199,9 @@ export function applyPreset(target: KoraParams, preset: Preset): KoraParams {
     // change, and resetting the count here would leave them visible but out of the solve.
     obstacleCount: target.obstacleCount,
     gizmoMode: target.gizmoMode,
+    // The backdrop is a viewing choice, not part of the fire a preset describes.
+    environment: target.environment,
+    backgroundIntensity: target.backgroundIntensity,
     sourceDirection: defaultParams.sourceDirection.clone(),
     sourcePosition: defaultParams.sourcePosition.clone(),
     wind: defaultParams.wind.clone(),
