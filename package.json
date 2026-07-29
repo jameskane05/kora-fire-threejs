@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "deploy": "vite build && cd dist && touch .nojekyll && git init -q && git add -A && git commit -qm 'Publish' && git push -qf git@github.com:jameskane05/kora-fire-threejs.git HEAD:gh-pages"
   },
   "dependencies": {
     "lil-gui": "^0.21.0",
