@@ -98,6 +98,7 @@ export interface FieldsView {
   expansion: Storage3DTexture;
   poissonA: Storage3DTexture;
   poissonB: Storage3DTexture;
+  solid: Storage3DTexture;
 }
 
 export class SimFields {
@@ -121,6 +122,16 @@ export class SimFields {
    */
   readonly poissonA: Storage3DTexture;
   readonly poissonB: Storage3DTexture;
+  /**
+   * Displacement volumes rasterised onto the grid: (solid velocity xyz, signed distance w).
+   *
+   * The primitives are analytic and could be evaluated wherever they are needed, but they are
+   * needed in four places — the Poisson coefficients, the divergence, the gradient and the
+   * raymarcher — and the coefficients pass alone would want seven evaluations per voxel. Baking
+   * once a frame turns all of that into a single fetch, the same trade already made for the
+   * Poisson weights and the curl noise.
+   */
+  readonly solid: Storage3DTexture;
 
   constructor(readonly res: Res) {
     this.chem = new Field(res, 'rgba16f', 'chem');
@@ -131,6 +142,7 @@ export class SimFields {
     this.expansion = makeTexture(res, 'r32f', 'expansion');
     this.poissonA = makeTexture(res, 'rgba16f', 'poissonA');
     this.poissonB = makeTexture(res, 'rgba16f', 'poissonB');
+    this.solid = makeTexture(res, 'rgba16f', 'solid');
   }
 
   get count(): number {
@@ -155,6 +167,7 @@ export class SimFields {
       expansion: this.expansion,
       poissonA: this.poissonA,
       poissonB: this.poissonB,
+      solid: this.solid,
     };
   }
 
@@ -167,5 +180,6 @@ export class SimFields {
     this.expansion.dispose();
     this.poissonA.dispose();
     this.poissonB.dispose();
+    this.solid.dispose();
   }
 }

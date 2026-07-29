@@ -12,6 +12,7 @@ import {
   T_ATM,
   speciesTable,
 } from './constants';
+import { createObstacleUniforms } from './obstacles';
 import type { KoraParams } from './params';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -101,6 +102,12 @@ export function createUniforms(params: KoraParams) {
     /** Rturb(l) sampled per band, packed coarse-to-fine */
     ectGain: uniform(new Vector4(1, 1, 1, 1)),
     ectGain4: uniform(1),
+
+    /**
+     * Displacement volumes. Written by the scene rather than by `syncUniforms`, since they are
+     * driven by the gizmo and by frame-to-frame motion rather than by the parameter block.
+     */
+    obstacles: createObstacleUniforms(),
   };
 }
 

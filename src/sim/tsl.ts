@@ -138,6 +138,16 @@ export function offset(o: readonly [number, number, number] | (typeof NEIGHBOURS
   return ivec3(o[0], o[1], o[2]);
 }
 
+/**
+ * World-space position of a point given in voxel units.
+ *
+ * Structurally typed on the two uniforms it reads rather than on the whole uniform block, so
+ * that grid-to-world conversion can sit here without this module depending on the uniforms.
+ */
+export function worldPos(u: { origin: N; dx: N }, voxel: N): N {
+  return u.origin.add(voxel.mul(u.dx));
+}
+
 /** floor() that returns an integer vector. */
 export function ifloor(v: N): N {
   return ivec3(floor(v));

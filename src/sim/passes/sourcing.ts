@@ -6,8 +6,11 @@
  * with the values of the corresponding input fields" (§5.1.2). The premixed fuel/oxidiser amounts
  * arriving in `sourceMix` were built by the §5.1.1 pre-mixing rule in `uniforms.ts`.
  */
-import { T, load, type N } from '../tsl';
+import { T, load, worldPos, type N } from '../tsl';
+import { makeSolid } from './solids';
 import type { Ctx } from '../context';
+
+export { worldPos };
 
 const { float, vec3, vec4, clamp, dot, exp, length, max, mix, oneMinus, smoothstep, textureStore } = T;
 
@@ -17,11 +20,6 @@ function capsule(p: N, a: N, b: N, r: N): N {
   const ba = b.sub(a);
   const h = clamp(dot(pa, ba).div(max(dot(ba, ba), float(1e-8))), 0.0, 1.0);
   return length(pa.sub(ba.mul(h))).sub(r);
-}
-
-/** World-space position of a point given in voxel units. */
-export function worldPos(u: Ctx['u'], voxel: N): N {
-  return u.origin.add(voxel.mul(u.dx));
 }
 
 /** Signed distance from a point in voxel units to the emitter surface. */
@@ -40,8 +38,9 @@ export function sourceMask(u: Ctx['u'], voxel: N): N {
   return oneMinus(smoothstep(edge.negate(), edge, sourceSdf(u, voxel)));
 }
 
-export function sourcingPass(ctx: Ctx): N {
+export function sourcingPass(ctx: Ctx, obstacles: number): N {
   const { g, f, u, m } = ctx;
+  const solid = makeSolid(ctx, obstacles);
 
   return g.kernel(() => {
     const c = g.coord();
@@ -104,9 +103,27 @@ export function sourcingPass(ctx: Ctx): N {
       mix(vel.z, u.sourceVelocity.z, mz),
     );
 
-    textureStore(f.chem.write, c, vec4(fuel, oxygen, nitrogen, chem.w)).toWriteOnly();
-    textureStore(f.aux.write, c, vec4(soot, temperature, aux.z, aux.w)).toWriteOnly();
-    textureStore(f.vel.write, c, vec4(newVel, 0.0)).toWriteOnly();
+    // ---- displacement volumes ------------------------------------------------------------
+    // A cell inside a solid is not fluid, so it is reset to still air rather than left to
+    // accumulate. The velocity boundary keeps flow from entering, but advection and diffusion
+    // are not boundary-aware and would otherwise let heat and soot seep in and glow there.
+    // Doing it here, in the pass that already holds all three buffers, costs no extra pass.
+    const chemOut = vec4(fuel, oxygen, nitrogen, chem.w).toVar();
+    const auxOut = vec4(soot, temperature, aux.z, aux.w).toVar();
+    const velOut = vec4(newVel, 0.0).toVar();
+
+    if (obstacles > 0) {
+      const buried = solid.inside(c);
+      chemOut.assign(buried.select(vec4(0.0, 0.21, 0.79, 0.0), chemOut));
+      auxOut.assign(
+        buried.select(vec4(0.0, u.ambientTemperature, 0.0, u.dx.mul(5.0)), auxOut),
+      );
+      velOut.assign(buried.select(vec4(solid.velocity(c), 0.0), velOut));
+    }
+
+    textureStore(f.chem.write, c, chemOut).toWriteOnly();
+    textureStore(f.aux.write, c, auxOut).toWriteOnly();
+    textureStore(f.vel.write, c, velOut).toWriteOnly();
   });
 }
 

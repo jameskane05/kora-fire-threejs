@@ -2,6 +2,7 @@ import { Vector3 } from 'three/webgpu';
 import type { FuelName } from './constants';
 import type { DebugChannel } from '../render/VolumeRenderer';
 import type { Quality } from '../ui/quality';
+import type { GizmoMode } from './obstacles';
 
 /**
  * The artist-facing parameter set.
@@ -95,6 +96,17 @@ export interface KoraParams {
   bloom: number;
   showFlameFront: boolean;
 
+  /**
+   * How many displacement volumes the solver is built for.
+   *
+   * A build-time constant rather than a uniform: the primitives are unrolled into the kernels, so
+   * an unused slot is not merely cheap but absent, and a scene with no obstacles pays nothing at
+   * all. Adding or removing one recompiles; moving, turning or resizing one is a uniform write.
+   */
+  obstacleCount: number;
+  /** What a drag does to the selected primitive, on the desktop gizmo and in the headset alike. */
+  gizmoMode: GizmoMode;
+
   // ---- diagnostics ----
   /** Floor grid, world origin and simulation bounds, drawn behind the volume. */
   showGrid: boolean;
@@ -165,6 +177,11 @@ export const defaultParams: KoraParams = {
   raymarchSteps: 160,
   bloom: 0.5,
   showFlameFront: false,
+
+  // One by default. It costs a millisecond, and a solid sitting in the plume is the quickest way
+  // to see that the obstacles are part of the solve rather than drawn over it.
+  obstacleCount: 1,
+  gizmoMode: 'translate',
 
   showGrid: true,
   debugView: 'off',

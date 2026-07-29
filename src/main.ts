@@ -25,6 +25,8 @@ import { VolumeRenderer } from './render/VolumeRenderer';
 import { createGui, refreshGui } from './ui/gui';
 import { PRESETS, applyPreset, type Preset } from './ui/presets';
 import { QUALITY, QUALITY_TIERS, applyQuality, type Quality } from './ui/quality';
+import { Obstacles, type GizmoMode } from './scene/Obstacles';
+import type { ObstacleKind } from './sim/obstacles';
 import { Hands, previewHand } from './xr/Hands';
 import { ImmersiveMode } from './xr/ImmersiveMode';
 
@@ -90,7 +92,7 @@ async function main() {
 
   let solver = new KoraSolver(renderer, params, noise);
   let volume = new VolumeRenderer(
-    { field: solver.renderField, blur: solver.renderBlur },
+    { field: solver.renderField, blur: solver.renderBlur, solid: solver.fields.solid },
     params.domainSize,
   );
   // Everything the viewer looks at hangs off the immersive rig, which is inert on the desktop
@@ -112,6 +114,47 @@ async function main() {
   domainHelper.visible = params.showGrid;
   immersive.attach(domainHelper);
   immersive.setDomainSize(params.domainSize);
+
+  // ---- displacement volumes -----------------------------------------------------------------
+  // The proxies ride the rig with the fire so they stay put relative to it in VR, but the gizmo
+  // is a mouse tool and belongs in world space alongside the desktop camera.
+  const obstacles = new Obstacles(solver.uniforms, camera, renderer.domElement, (dragging) => {
+    controls.enabled = !dragging;
+  });
+  immersive.attach(obstacles.group);
+  scene.add(obstacles.helper);
+
+  // In a headset a pinch grabs the primitives directly, and the mode moves to a panel you can
+  // actually hit with a hand ray.
+  immersive.setManipulator(obstacles);
+  scene.add(immersive.hud);
+
+  // Seeded before the count callback is wired, so it matches the count the solver was already
+  // built for rather than forcing a rebuild on the first frame. Sized and offset so the plume
+  // wraps past it — a primitive big enough to cap the flame outright shows less than one the
+  // fire gets around.
+  addObstacle('sphere');
+  const seeded = obstacles.targets()[0];
+  seeded.scale.setScalar(0.6);
+  seeded.position.x += 0.1;
+  obstacles.select(null);
+
+  // Adding or removing a primitive changes how many are unrolled into the kernels, so the graph
+  // has to be rebuilt. Dragging one does not.
+  obstacles.onCountChanged = (count) => {
+    params.obstacleCount = count;
+    rebuild();
+    refreshGui(gui);
+  };
+
+  // Every route into a mode change ends up here, so the panel, the keys and the headset's button
+  // strip can never disagree about which one is active.
+  obstacles.onModeChanged = (mode) => {
+    params.gizmoMode = mode;
+    immersive.showMode(mode);
+    refreshGui(gui);
+  };
+  obstacles.setMode(params.gizmoMode);
 
   // ---- post processing --------------------------------------------------------------------
   const post = new RenderPipeline(renderer);
@@ -151,7 +194,7 @@ async function main() {
 
     solver = new KoraSolver(renderer, params, noise);
     volume = new VolumeRenderer(
-      { field: solver.renderField, blur: solver.renderBlur },
+      { field: solver.renderField, blur: solver.renderBlur, solid: solver.fields.solid },
       params.domainSize,
     );
     immersive.attach(volume.mesh);
@@ -166,6 +209,10 @@ async function main() {
     immersive.attach(domainHelper);
 
     immersive.setDomainSize(params.domainSize);
+
+    // A rebuild means a fresh uniform block, so the displacement volumes have to be re-pointed at
+    // it or they would carry on writing to the discarded one and freeze in place.
+    obstacles.bind(solver.uniforms);
   }
 
   /**
@@ -178,6 +225,9 @@ async function main() {
 
   function enterImmersive() {
     controls.enabled = false;
+    // The transform gizmo is a mouse tool, and its thin axis handles are both unusable with a
+    // hand ray and squarely in the way of the fire. Pinching a primitive replaces it.
+    obstacles.setGizmoEnabled(false);
 
     const order = QUALITY_TIERS.indexOf(params.quality);
     if (order < QUALITY_TIERS.indexOf(IMMERSIVE_QUALITY)) {
@@ -190,6 +240,7 @@ async function main() {
 
   function exitImmersive() {
     controls.enabled = true;
+    obstacles.setGizmoEnabled(true);
     applyPixelRatio(params.quality);
 
     if (qualityBeforeXR) {
@@ -286,7 +337,22 @@ async function main() {
       onShowGrid: (visible: boolean) => {
         domainHelper.visible = visible;
       },
+      onAddObstacle: (kind: ObstacleKind) => addObstacle(kind),
+      onRemoveObstacle: () => {
+        if (obstacles.selection !== null) obstacles.remove(obstacles.selection);
+      },
+      onGizmoMode: (mode: GizmoMode) => obstacles.setMode(mode),
     };
+  }
+
+  /**
+   * Drops a primitive just above the emitter, where it is in the plume and obviously doing
+   * something. A fixed fraction of the domain would land in clear air for the shorter presets.
+   */
+  function addObstacle(kind: ObstacleKind) {
+    const at = params.sourcePosition.clone();
+    at.y += params.sourceLength + 0.45;
+    obstacles.add(kind, at);
   }
 
   // Exposed so the field statistics and parameters can be driven from the console or an
@@ -295,6 +361,9 @@ async function main() {
     probe: logProbe,
     profile: runProfile,
     setQuality: (q: Quality) => callbacks().onQuality(q),
+    addObstacle: (kind: ObstacleKind = 'sphere') => addObstacle(kind),
+    obstacles: () => obstacles,
+    immersive: () => immersive,
     params: () => params,
     setDebugView: (v: KoraParams['debugView'], scale = 1) => {
       params.debugView = v;
@@ -380,6 +449,9 @@ async function main() {
     solver.params.bloom = params.bloom;
     bloomPass.strength.value = params.bloom;
 
+    // Before the step, so the velocity a dragged primitive picked up this frame is the boundary
+    // flux the projection sees rather than one frame stale.
+    obstacles.update(dt);
     solver.step(dt);
     volume.update(params, frame++);
 
@@ -406,10 +478,18 @@ async function main() {
   });
 
   window.addEventListener('keydown', (e) => {
+    if (e.target instanceof HTMLInputElement) return;
+
     if (e.key === ' ') {
       e.preventDefault();
       solver.detonate(1.0);
     }
+
+    // three's own convention for its transform gizmo, so it is where anyone expects it.
+    const mode = { w: 'translate', e: 'rotate', r: 'scale' }[e.key.toLowerCase()];
+    if (mode) obstacles.setMode(mode as GizmoMode);
+
+    if (e.key === 'Escape') obstacles.select(null);
   });
 
   // Not requestAnimationFrame: inside a session three has to drive the loop from the headset's

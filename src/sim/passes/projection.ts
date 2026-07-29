@@ -30,6 +30,7 @@
  * Wind (§5.3.2) enters as a Neumann condition on the inflow faces of the outer voxel layer.
  */
 import { T, load, type N } from '../tsl';
+import { makeSolid, solidFace } from './solids';
 import type { Ctx } from '../context';
 
 const { float, ivec3, vec3, vec4, dot, log, max, textureStore } = T;
@@ -103,9 +104,10 @@ const FACES = [
  * The common factor dt / dx^2 is left out and folded into the right-hand side instead, so the
  * stored weights stay near unity and survive a half-float round trip.
  */
-export function pressureCoefficientsPass(ctx: Ctx): N {
+export function pressureCoefficientsPass(ctx: Ctx, obstacles: number): N {
   const { g, f, u } = ctx;
   const density = makeDensity(ctx);
+  const solid = makeSolid(ctx, obstacles);
 
   return g.kernel(() => {
     const c = g.coord();
@@ -117,11 +119,17 @@ export function pressureCoefficientsPass(ctx: Ctx): N {
 
       // Neumann on wind inflow faces: a prescribed flux means no pressure coupling.
       const inflow = dot(u.wind, vec3(step[0], step[1], step[2]).negate()).greaterThan(float(0.0));
-      const neumann = g
+      const wind = g
         .interior(n)
         .not()
         .and(inflow)
         .and(u.windEnabled.greaterThan(float(0.5)));
+
+      // A solid face is the same kind of boundary and drops out of the stencil the same way.
+      // This is the whole mechanism by which obstacles deflect the flow: with no pressure
+      // coupling across the face, the solve can only satisfy the divergence constraint by
+      // routing the fluid around the solid.
+      const neumann = obstacles > 0 ? wind.or(solidFace(solid, c, step)) : wind;
 
       return neumann.select(float(0.0), float(1.0).div(rhoFace));
     });
@@ -131,7 +139,12 @@ export function pressureCoefficientsPass(ctx: Ctx): N {
     // multiply by zero into a NaN that spreads through the whole field in a few sweeps.
     const total = w.reduce((a, b) => a.add(b));
     const invTotal = float(1.0).div(max(total, float(1e-3)));
-    const interior = g.interior(c).select(float(1.0), float(0.0));
+
+    // Solid cells are pinned to zero alongside the ghost cells. Every face of one is Neumann, so
+    // whatever they solved to could never reach the fluid anyway — but leaving them free lets the
+    // 1/sum(w) factor blow up on a cell with no coupled faces at all.
+    const solved = obstacles > 0 ? g.interior(c).and(solid.inside(c).not()) : g.interior(c);
+    const interior = solved.select(float(1.0), float(0.0));
 
     textureStore(f.poissonA, c, vec4(w[0], w[1], w[2], w[3])).toWriteOnly();
     textureStore(f.poissonB, c, vec4(w[4], w[5], invTotal, interior)).toWriteOnly();
@@ -165,9 +178,10 @@ export function pressurePass(ctx: Ctx): N {
 }
 
 /** u <- u* - (dt / rho_face) grad p, evaluated on the MAC faces. */
-export function pressureGradientPass(ctx: Ctx): N {
+export function pressureGradientPass(ctx: Ctx, obstacles: number): N {
   const { g, f, u } = ctx;
   const density = makeDensity(ctx);
+  const solid = makeSolid(ctx, obstacles);
 
   return g.kernel(() => {
     const c = g.coord();
@@ -190,7 +204,12 @@ export function pressureGradientPass(ctx: Ctx): N {
         .and(inflow)
         .and(u.windEnabled.greaterThan(float(0.5)));
 
-      return prescribe.select(windComp, corrected);
+      const projected = prescribe.select(windComp, corrected);
+
+      // The stencil gave a solid face no pressure coupling, but the gradient here is taken
+      // across it regardless, so the boundary value has to be restored rather than corrected.
+      if (obstacles === 0) return projected;
+      return solid.face(c, axis).select(solid.faceVelocity(c, axis), projected);
     };
 
     const updated = vec3(

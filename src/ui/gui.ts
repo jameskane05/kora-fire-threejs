@@ -2,6 +2,7 @@ import GUI from 'lil-gui';
 import { DEBUG_CHANNELS } from '../render/VolumeRenderer';
 import { FUELS } from '../sim/constants';
 import type { KoraParams } from '../sim/params';
+import { MAX_OBSTACLES, type GizmoMode, type ObstacleKind } from '../sim/obstacles';
 import { PRESETS, type Preset } from './presets';
 import { QUALITY, QUALITY_TIERS, type Quality } from './quality';
 
@@ -20,6 +21,9 @@ export interface GuiCallbacks {
   onProfile(): void;
   onQuality(quality: Quality): void;
   onShowGrid(visible: boolean): void;
+  onAddObstacle(kind: ObstacleKind): void;
+  onRemoveObstacle(): void;
+  onGizmoMode(mode: GizmoMode): void;
 }
 
 export function createGui(params: KoraParams, cb: GuiCallbacks): GUI {
@@ -163,6 +167,29 @@ export function createGui(params: KoraParams, cb: GuiCallbacks): GUI {
     .name('MacCormack advection')
     .onChange(() => cb.onStructuralChange());
   solver.close();
+
+  // ---- displacement volumes ---------------------------------------------------------------------
+  // Not from the paper: Kora takes collision objects from the host framework. These enter the
+  // solve as Neumann boundaries in the pressure projection, so the plume goes around them, and a
+  // primitive dragged through the fire pushes it.
+  const solids = gui.addFolder('Displacement volumes');
+  const shapes = {
+    sphere: () => cb.onAddObstacle('sphere'),
+    box: () => cb.onAddObstacle('box'),
+    capsule: () => cb.onAddObstacle('capsule'),
+    remove: () => cb.onRemoveObstacle(),
+  };
+  solids.add(shapes, 'sphere').name(`add sphere (max ${MAX_OBSTACLES})`);
+  solids.add(shapes, 'box').name('add box');
+  solids.add(shapes, 'capsule').name('add capsule');
+  solids.add(shapes, 'remove').name('remove selected');
+  // Bound to `params` so the keyboard shortcuts and the headset's button strip can drive it and
+  // have this reflect the change, rather than the three of them drifting apart.
+  solids
+    .add(params, 'gizmoMode', ['translate', 'rotate', 'scale'])
+    .name('gizmo (W / E / R)')
+    .onChange((m: GizmoMode) => cb.onGizmoMode(m));
+  solids.close();
 
   // ---- diagnostics -----------------------------------------------------------------------------
   const debug = gui.addFolder('Diagnostics');

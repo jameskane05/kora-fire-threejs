@@ -190,6 +190,10 @@ export function applyPreset(target: KoraParams, preset: Preset): KoraParams {
   const base: KoraParams = {
     ...defaultParams,
     substeps: target.substeps,
+    // Scene contents, not part of the look: the primitives stay where they are across a preset
+    // change, and resetting the count here would leave them visible but out of the solve.
+    obstacleCount: target.obstacleCount,
+    gizmoMode: target.gizmoMode,
     sourceDirection: defaultParams.sourceDirection.clone(),
     sourcePosition: defaultParams.sourcePosition.clone(),
     wind: defaultParams.wind.clone(),

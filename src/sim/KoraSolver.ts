@@ -47,6 +47,8 @@ import {
 } from './passes/projection';
 import { guidingPass } from './passes/guiding';
 import { advectionPass } from './passes/advection';
+import { solidBakePass, solidVelocityPass } from './passes/solids';
+import { MAX_OBSTACLES } from './obstacles';
 
 const { float, vec4, max, length, textureStore } = T;
 
@@ -184,6 +186,8 @@ export class KoraSolver {
         const c = g.coord();
         textureStore(this.renderField, c, vec4(0.0)).toWriteOnly();
         textureStore(this.renderBlur, c, vec4(0.0)).toWriteOnly();
+        // Empty of solids, so a frame built without obstacles still reads a sane distance.
+        textureStore(f.solid, c, vec4(0.0, 0.0, 0.0, u.dx.mul(4.0))).toWriteOnly();
       }),
     ];
   }
@@ -210,8 +214,14 @@ export class KoraSolver {
       ctx.f = f.view();
     };
 
+    const obstacles = Math.min(p.obstacleCount, MAX_OBSTACLES);
+
+    // Displacement volumes, rasterised before anything reads them. Not part of Algorithm 1:
+    // Kora takes collision objects from the host framework rather than describing them.
+    if (obstacles > 0) push('solidBake', solidBakePass(ctx, obstacles));
+
     // 1-2 — dissipation and emission
-    run('sourcing', sourcingPass(ctx), f.chem, f.aux, f.vel);
+    run('sourcing', sourcingPass(ctx, obstacles), f.chem, f.aux, f.vel);
 
     // 4 — mass diffusion
     for (const axis of [0, 1, 2] as const) {
@@ -243,13 +253,16 @@ export class KoraSolver {
     // 15 — external forces
     run('forces', forcesPass(ctx), f.vel);
 
-    // 16 — pressure projection
+    // 16 — pressure projection. The solid boundary is imposed on the velocities first, so the
+    // divergence the solve is handed already carries the obstacles' motion as its boundary flux.
+    if (obstacles > 0) run('solidVelocity', solidVelocityPass(ctx, obstacles), f.vel);
+
     push('divergence', divergencePass(ctx));
-    push('poissonCoefficients', pressureCoefficientsPass(ctx));
+    push('poissonCoefficients', pressureCoefficientsPass(ctx, obstacles));
     for (let i = 0; i < p.pressureIterations; i++) {
       run(`pressure.${i}`, pressurePass(ctx), f.pressure);
     }
-    run('pressureGradient', pressureGradientPass(ctx), f.vel);
+    run('pressureGradient', pressureGradientPass(ctx, obstacles), f.vel);
 
     // 17 — frequency-domain guiding
     if (p.guidingWeight > 0) {

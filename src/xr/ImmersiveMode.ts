@@ -18,7 +18,10 @@
  * the simulation turns in front of you. Moving the viewer instead would be both more work and,
  * on a device with no thumbsticks, a good way to make someone ill.
  */
-import { Group, Object3D, Quaternion, Vector3, type Renderer } from 'three/webgpu';
+import { Group, Object3D, Quaternion, Raycaster, Vector3, type Renderer } from 'three/webgpu';
+import { RayGrab, type PointerRay } from './RayGrab';
+import { ModePanel } from './ModePanel';
+import type { GizmoMode } from '../scene/Obstacles';
 
 /** Where the domain is placed relative to the viewer, in metres. */
 const PLACEMENT = { distance: 1.75, height: 1.25 };
@@ -60,8 +63,31 @@ export interface ImmersiveCallbacks {
   onExit(): void;
 }
 
+/**
+ * The objects a pinch is allowed to pick up, and what to do once it has.
+ *
+ * Kept as an interface so the XR code does not need to know what a displacement volume is; it
+ * only needs some meshes to aim at and somewhere to report the selection.
+ */
+export interface Manipulator {
+  /** Meshes a pointer may grab. */
+  targets(): Object3D[];
+  /** What a drag on a held object means. */
+  readonly mode: GizmoMode;
+  setMode(mode: GizmoMode): void;
+  /** Notified when a pinch picks one, or clears the selection. */
+  selectObject(object: Object3D | null): void;
+}
+
+/**
+ * A pinch either turns the whole domain or moves one thing inside it, decided once at the moment
+ * the pinch begins and fixed for its duration.
+ */
+type DragKind = 'turntable' | 'object';
+
 interface Drag {
   source: XRInputSource;
+  kind: DragKind;
   /** false until the first pose arrives; a pinch's opening frame only establishes an origin */
   started: boolean;
   yaw: number;
@@ -108,9 +134,21 @@ export class ImmersiveMode {
   /** Holds the scene content, offset so the pivot sits at the middle of the domain. */
   private readonly content = new Group();
 
+  /** Reference-space furniture: the mode buttons. Added to the scene, not to the rig. */
+  readonly hud = new Group();
+
   private readonly drags = new Map<XRInputSource, Drag>();
   private readonly velocity = { yaw: 0, pitch: 0 };
   private readonly direction = new Vector3();
+  private readonly raycaster = new Raycaster();
+  private readonly grab = new RayGrab();
+  private readonly ray: PointerRay = {
+    origin: new Vector3(),
+    direction: new Vector3(),
+    orientation: new Quaternion(),
+  };
+  private panel: ModePanel | null = null;
+  private manipulator: Manipulator | null = null;
   private domainSize = 1;
   private button: HTMLButtonElement | null = null;
   private session: XRSession | null = null;
@@ -125,6 +163,22 @@ export class ImmersiveMode {
 
     this.onSelectStart = this.onSelectStart.bind(this);
     this.onSelectEnd = this.onSelectEnd.bind(this);
+  }
+
+  /** Supplies what a pinch may pick up. The mode panel appears once one is set. */
+  setManipulator(manipulator: Manipulator): void {
+    this.manipulator = manipulator;
+
+    if (!this.panel) {
+      this.panel = new ModePanel(manipulator.mode);
+      this.hud.add(this.panel.group);
+    }
+    this.panel.setMode(manipulator.mode);
+  }
+
+  /** Reflects a mode change that came from somewhere else, so the button strip agrees. */
+  showMode(mode: GizmoMode): void {
+    this.panel?.setMode(mode);
   }
 
   get active(): boolean {
@@ -230,6 +284,7 @@ export class ImmersiveMode {
 
     this.callbacks.onEnter();
     this.layout();
+    this.panel?.setVisible(true);
 
     await this.renderer.xr.setSession(session);
 
@@ -242,9 +297,11 @@ export class ImmersiveMode {
   private end(): void {
     this.session = null;
     this.drags.clear();
+    this.grab.end();
     this.velocity.yaw = 0;
     this.velocity.pitch = 0;
 
+    this.panel?.setVisible(false);
     this.layout();
     this.callbacks.onExit();
 
@@ -254,15 +311,80 @@ export class ImmersiveMode {
     }
   }
 
+  /**
+   * Reads a pointer's pose into `this.ray`, in reference space.
+   *
+   * On visionOS the transient pointer's target ray is built to pass through whatever the user was
+   * looking at when they pinched, so aiming it is gaze selection without asking for eye tracking —
+   * which the platform will not hand over anyway. On a headset with controllers the same ray is
+   * simply where the controller points, and the behaviour here is identical.
+   */
+  private readRay(source: XRInputSource, frame: XRFrame, referenceSpace: XRReferenceSpace): boolean {
+    const pose = frame.getPose(source.targetRaySpace, referenceSpace);
+    if (!pose) return false;
+
+    const { position, orientation } = pose.transform;
+    this.ray.origin.set(position.x, position.y, position.z);
+    this.ray.orientation.set(orientation.x, orientation.y, orientation.z, orientation.w);
+    this.ray.direction.set(0, 0, -1).applyQuaternion(this.ray.orientation);
+    return true;
+  }
+
+  /** The nearest of `targets` along the current ray, or null. */
+  private pick(targets: Object3D[]): Object3D | null {
+    if (targets.length === 0) return null;
+
+    this.raycaster.set(this.ray.origin, this.ray.direction);
+    return this.raycaster.intersectObjects(targets, false)[0]?.object ?? null;
+  }
+
+  /**
+   * Decides what this pinch is for, once, from where it was aimed when it started.
+   *
+   * Aim at a mode button and it switches modes without starting a drag; aim at a primitive and the
+   * drag carries that primitive; aim anywhere else and it turns the whole domain. Committing to
+   * one of the three up front matters: re-deciding mid-drag on a hand ray that wanders across an
+   * edge would have the domain lurch every time the pointer clipped an obstacle.
+   */
   private onSelectStart(event: XRInputSourceEvent): void {
     // Catching a coasting domain should stop it, the way putting a hand on a globe does.
     this.velocity.yaw = 0;
     this.velocity.pitch = 0;
 
+    const referenceSpace = this.renderer.xr.getReferenceSpace();
+    let kind: DragKind = 'turntable';
+
+    if (referenceSpace && this.readRay(event.inputSource, event.frame, referenceSpace)) {
+      // The pick runs against last frame's matrices otherwise, and the domain may have been
+      // turning right up to the moment of the pinch.
+      this.rig.updateMatrixWorld(true);
+      this.hud.updateMatrixWorld(true);
+
+      const button = this.panel?.visible ? this.pick(this.panel.targets) : null;
+      if (button) {
+        const mode = this.panel?.resolve(button);
+        if (mode && this.manipulator) {
+          this.manipulator.setMode(mode);
+          this.panel?.setMode(mode);
+        }
+        return;
+      }
+
+      const target = this.manipulator ? this.pick(this.manipulator.targets()) : null;
+      if (target && this.manipulator) {
+        this.manipulator.selectObject(target);
+        this.grab.begin(target, this.ray, this.manipulator.mode);
+        kind = 'object';
+      } else {
+        this.manipulator?.selectObject(null);
+      }
+    }
+
     // transient-pointer is what a visionOS pinch produces, and it only exists for the duration
     // of the pinch. Controllers and gaze are accepted too; they behave the same way here.
     this.drags.set(event.inputSource, {
       source: event.inputSource,
+      kind,
       started: false,
       yaw: 0,
       pitch: 0,
@@ -272,6 +394,8 @@ export class ImmersiveMode {
   }
 
   private onSelectEnd(event: XRInputSourceEvent): void {
+    const drag = this.drags.get(event.inputSource);
+    if (drag?.kind === 'object') this.grab.end();
     this.drags.delete(event.inputSource);
   }
 
@@ -300,6 +424,13 @@ export class ImmersiveMode {
       for (const drag of this.drags.values()) {
         const pose = frame.getPose(drag.source.targetRaySpace, referenceSpace);
         if (!pose) continue;
+
+        // A pinch that picked something up moves that and nothing else — the domain stays put
+        // under it, so you can place a primitive against a part of the fire you can still see.
+        if (drag.kind === 'object') {
+          if (this.readRay(drag.source, frame, referenceSpace)) this.grab.move(this.ray);
+          continue;
+        }
 
         const { yaw, pitch } = aim(pose.transform.orientation, this.direction);
         const { x, y } = pose.transform.position;

@@ -84,6 +84,8 @@ export interface VolumeInputs {
   field: Storage3DTexture;
   /** (blurred temperature, blurred heat, blurred soot, blurred phi) */
   blur: Storage3DTexture;
+  /** (solid velocity, signed distance) — the march terminates where w goes negative */
+  solid: Storage3DTexture;
 }
 
 export class VolumeRenderer {
@@ -107,6 +109,8 @@ export class VolumeRenderer {
     /** 0 = shaded, otherwise a max-intensity projection of one raw channel */
     debugChannel: uniform(0),
     debugScale: uniform(1),
+    /** 1 while any displacement volume exists, gating the solid fetch out of the march */
+    obstacles: uniform(0),
   };
 
   constructor(inputs: VolumeInputs, domainSize: number) {
@@ -206,6 +210,17 @@ export class VolumeRenderer {
 
         const p = origin.add(dir.mul(t));
         const uvw = p.sub(u.boxMin).div(extent);
+
+        // Displacement volumes are opaque. The solver already keeps them empty of fuel and heat,
+        // so marching through one accumulates nothing — but everything behind one would still
+        // show through it. Stopping here is what makes an obstacle read as solid.
+        // The branch is on a uniform, so with no obstacles in the scene the fetch is skipped
+        // outright rather than fetched and discarded.
+        If(u.obstacles.greaterThan(float(0.5)), () => {
+          If(texture3D(inputs.solid, uvw).level(int(0)).w.lessThan(float(0.0)), () => {
+            Break();
+          });
+        });
 
         const s = texture3D(inputs.field, uvw).level(int(0));
         const b = texture3D(inputs.blur, uvw).level(int(0));
@@ -313,6 +328,7 @@ export class VolumeRenderer {
     u.showFlameFront.value = params.showFlameFront ? 1 : 0;
     u.debugChannel.value = DEBUG_CHANNELS.indexOf(params.debugView);
     u.debugScale.value = params.debugScale;
+    u.obstacles.value = params.obstacleCount > 0 ? 1 : 0;
     u.frame.value = frame;
   }
 

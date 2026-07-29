@@ -73,8 +73,26 @@ The solver follows Algorithm 1 of the paper, one pass per step, orchestrated in 
 | §5.4.1 blackbody flame colour, hollow flame, eq. (41) | [`VolumeRenderer.ts`](src/render/VolumeRenderer.ts) |
 | §5.4.2 Kora diffusion and crust | [`VolumeRenderer.ts`](src/render/VolumeRenderer.ts) |
 | §6 production setups | [`presets.ts`](src/ui/presets.ts) |
+| *(not in the paper)* solid displacement volumes | [`solids.ts`](src/sim/passes/solids.ts), [`obstacles.ts`](src/sim/obstacles.ts) |
 
 Physical constants and the fuel database are in [`constants.ts`](src/sim/constants.ts). The controls are grouped the way the paper groups its toolset — sourcing, simulation control, art direction, rendering — because §5.2 argues the value is as much in *which* parameters get exposed as in the solver behind them.
+
+## Displacement volumes
+
+Not from the paper — Kora inherits collision objects from the host framework rather than describing them — but a fire that ignores the set isn't much use. One sphere is in the plume by default; add more from the *Displacement volumes* folder and drag them with the transform gizmo (`W` translate, `E` rotate, `R` scale, `Esc` deselect, click to pick). In a headset you pinch them directly — see [What a pinch does](#what-a-pinch-does).
+
+They're not painted on. A solid enters the solve as a boundary condition in the pressure projection:
+
+- every primitive is a **rounded box**, which with zero half-extents is a sphere and with extents along one axis a capsule, so one SDF covers all three shapes with no branching
+- the gizmo's scale is applied to the *sample point* rather than to the shape's extents, so all three axes are independent and a stretched sphere is a real ellipsoid in the solve. Scaling the extents cannot work here: a sphere is extents of zero with all of its size in the rounding radius, which is a scalar, so no amount of per-axis scaling would deform it. Dividing the point through instead makes the result no longer a true distance — it over-estimates along a stretched axis — so it's brought back by the smallest scale factor, which is enough because every consumer only tests the sign and the zero level set is exact
+- once a frame they're rasterised into a `(solid velocity, signed distance)` grid, in [`solids.ts`](src/sim/passes/solids.ts) — analytic shapes could be evaluated in place, but they're needed in four different passes and the Poisson stencil alone would want seven evaluations per voxel
+- a MAC face touching a solid cell gets **no pressure coupling** in the Poisson stencil, exactly like the wind inflow faces already did. That's the entire mechanism: the solve can only satisfy the divergence constraint by routing fluid around the obstacle
+- face velocities are pinned to the solid's own velocity before the divergence is taken, so the projection sees a *moving* obstacle as boundary flux. Drag one through the plume and it shoves the fire rather than merely blocking it
+- the raymarch terminates where the distance goes negative, so an obstacle occludes the fire behind it while fire in front still composites over
+
+The primitives are unrolled into the kernels at build time rather than looped over, so adding or removing one recompiles the graph and a scene with none pays nothing at all. Moving, turning and resizing are uniform writes and are free. One obstacle costs about 1.1 ms of a 23 ms frame at 96³ on an M3 Air, most of it the extra fetches in the Poisson coefficients and the gradient rather than the bake itself, which is 0.15 ms.
+
+Solid cells are decoupled whole rather than by sub-voxel fraction: a face counts as solid when either cell it separates is, which rounds the obstacle out to cell boundaries but leaves no half-buried cells still coupled through the pressure. They're also reset to still air each frame, since advection and diffusion aren't boundary-aware and would otherwise let heat seep in and glow inside the solid.
 
 ## How this differs from production Kora
 
@@ -122,6 +140,24 @@ The requirement worth calling out is that the session has to be WebGPU-backed. T
 The button stays hidden where immersive VR isn't offered at all, but says so explicitly on a browser that has WebXR without the WebGPU binding — that's the difference between an out-of-date visionOS and a bug, and it is not otherwise visible from inside a headset.
 
 Navigation is object-centric. The viewer's rig never moves; the domain is placed a metre and a bit in front of you, scaled so every preset frames the same way, and **pinch and drag to turn it**. On visionOS a pinch arrives as a `transient-pointer` input source that exists only for the duration of the gesture. Its ray is anchored near the shoulder and passes through the pinching hand, so moving that hand changes both where the ray starts and where it points; rather than guess which signal dominates, both are summed, which also makes controllers and gaze work unchanged. Release and it coasts to a stop, and catching it stops it dead. Release velocity is smoothed across frames and capped, because hand tracking drops poses and one long frame reporting an implausible speed will otherwise throw the domain through several turns.
+
+### What a pinch does
+
+A pinch has three possible meanings, and which one it has is decided **once, from where it was aimed at the moment it started**:
+
+- aimed at a **mode button** — switches what a drag does, without starting one
+- aimed at a **displacement volume** — that primitive is grabbed and the domain stays still under it
+- aimed at **anything else** — turns the whole domain, as before
+
+The pick is a raycast along the transient pointer's target ray. On visionOS that ray is constructed to pass through whatever you were looking at when you pinched, so aiming it *is* gaze selection — without asking for eye tracking, which the platform will not hand over anyway. On a headset with controllers the same ray is just where the controller points and the behaviour is identical.
+
+Committing to one meaning up front matters. Re-deciding each frame on a hand ray that inevitably wanders would have the domain lurch every time the pointer clipped the edge of an obstacle mid-drag.
+
+Mode lives on a small three-button strip (**move / turn / size**) floating below the domain in reference space, because neither of the desktop affordances survives a headset: there's no keyboard for `W`/`E`/`R`, and a gizmo made of thin axis handles is miserable to hit with a hand ray. The desktop gizmo is detached on entry and restored on exit; the selection highlight stays either way. All three routes into a mode change — panel, keys, button strip — go through one place, so they can't disagree.
+
+All three modes work from the same two signals, since a transient pointer is all there is: **move** carries the primitive at the depth it was picked at, **turn** applies the pointer's orientation delta, and **size** reads how far the hand has pushed along the ray it started on. Size deliberately ignores the ray's *current* direction — coupling scale to aim means the object swells every time you glance off to one side. All of it is computed in world space and converted back through the object's parent, since the primitives hang off a rig that is both scaled and rotated.
+
+Scaling in a headset is uniform only; one hand ray has no way to say *which* axis. Per-axis stretching is a desktop affair, via the gizmo's individual scale handles.
 
 ### Hands
 
