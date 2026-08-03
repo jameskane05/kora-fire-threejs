@@ -251,9 +251,11 @@ export class KoraSolver {
       run(`thermalConduction.${axis}`, diffusionPass(ctx, axis, 'thermal'), f.aux);
     }
 
-    // 8 — energy cascade turbulence
-    this.buildCascade(push);
-    run('energyCascade', energyCascadePass(ctx, this.pyramid, p.energyCascadeBands), f.vel);
+    // 8 — energy cascade turbulence (skipped entirely when bands = 0 — XR lean path)
+    if (p.energyCascadeBands > 0) {
+      this.buildCascade(push);
+      run('energyCascade', energyCascadePass(ctx, this.pyramid, p.energyCascadeBands), f.vel);
+    }
 
     // 9-14 — expansion and adiabatic cooling
     run('expansion', expansionPass(ctx), f.aux);
@@ -286,8 +288,12 @@ export class KoraSolver {
 
     // shading inputs, §5.4
     push('renderField', this.buildRenderField());
-    this.buildLowPass(push, 'renderBlur.a', this.renderField, this.renderBlur, 1, 1);
-    this.buildLowPass(push, 'renderBlur.b', this.renderBlur, this.renderBlur, 2, 1);
+    // §5.4.2 blur pyramid is only for Kora diffusion/crust. XR pins those to 0 — skip ~6
+    // full-grid separable dispatches rather than blurring into an unread texture.
+    if (p.koraDiffusion > 0 || p.koraCrust > 0) {
+      this.buildLowPass(push, 'renderBlur.a', this.renderField, this.renderBlur, 1, 1);
+      this.buildLowPass(push, 'renderBlur.b', this.renderBlur, this.renderBlur, 2, 1);
+    }
 
     this.frameLabels.push(labels);
     return nodes;
@@ -435,6 +441,17 @@ export class KoraSolver {
       { label: 'u.dx', value: () => u.dx, constant: true },
       { label: 'u.sourceMixFuel', value: () => u.sourceMix.x, constant: true },
       { label: 'u.sourceTemperature', value: () => u.sourceTemperature, constant: true },
+    ];
+  }
+
+  /** Lean channel set for procedural flame audio — keep the GPU→CPU read small and frequent. */
+  audioProbeChannels(): ProbeChannel[] {
+    return [
+      { label: 'maxFuel', value: (s) => s.chem.x },
+      { label: 'maxTemperature', value: (s) => s.aux.y },
+      { label: 'maxHeat', value: (s) => s.aux.z },
+      { label: 'maxSpeed', value: (s) => length(s.vel.xyz) },
+      { label: 'maxExpansion', value: (s) => s.expansion.x },
     ];
   }
 

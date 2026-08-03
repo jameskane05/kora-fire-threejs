@@ -15,6 +15,7 @@ import { pass } from 'three/tsl';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
+import { FLAME_AUDIO_ENABLED, FlameAudio } from './audio/FlameAudio';
 import { installGpuErrorReporter, gpuErrorSummary } from './debug/gpuErrors';
 import { disarmTimestamps, profile, printProfile, type ProfileOptions } from './debug/profile';
 import { KoraSolver } from './sim/KoraSolver';
@@ -26,13 +27,30 @@ import { createDomainHelper } from './render/DomainHelper';
 import { VolumeRenderer } from './render/VolumeRenderer';
 import { createGui, refreshGui } from './ui/gui';
 import { PRESETS, applyPreset, type Preset } from './ui/presets';
-import { QUALITY, QUALITY_TIERS, applyQuality, type Quality } from './ui/quality';
+import { QUALITY, applyQuality, type Quality } from './ui/quality';
+import {
+  IMMERSIVE_FIRE_FRAMED_SIZE,
+  applyImmersiveFireBudget,
+  IMMERSIVE_FIRE_SOLVE_INTERVAL,
+  restoreFireBudget,
+  snapshotFireBudget,
+  type ImmersiveFireSnapshot,
+} from './ui/immersiveFire';
 import { Obstacles, type GizmoMode } from './scene/Obstacles';
 import { Environment, DEFAULT_INTENSITY, type EnvironmentName } from './scene/Environment';
 import { Sparks } from './particles/Sparks';
-import type { ObstacleKind } from './sim/obstacles';
+import { MAX_HAND_SOLIDS, MAX_SCENE_OBSTACLES, type ObstacleKind } from './sim/obstacles';
 import { Hands, previewHand } from './xr/Hands';
+import { HandSolids } from './xr/HandSolids';
 import { ImmersiveMode, type ViewportPolicy } from './xr/ImmersiveMode';
+import { isVisionOS } from './xr/platform';
+
+function fireObstacleBudget(sceneCount: number, hands: boolean): number {
+  return sceneCount + (hands ? MAX_HAND_SOLIDS : 0);
+}
+
+const AUDIO_PROBE_PERIOD = 0.12;
+const AUDIO_PROBE_STRIDE = 8;
 
 const app = document.getElementById('app') as HTMLDivElement;
 const statsEl = document.getElementById('stats') as HTMLDivElement;
@@ -99,9 +117,24 @@ async function main() {
 
   const noise = createNoiseVolume(32);
   let params: KoraParams = applyPreset({ ...defaultParams }, PRESETS[0]);
+  params.environment = 'night';
+  params.backgroundIntensity = DEFAULT_INTENSITY.night;
+  params.obstacleCount = fireObstacleBudget(isVisionOS() ? 0 : 1, false);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, QUALITY[params.quality].pixelRatio));
 
   let solver = new KoraSolver(renderer, params, noise);
+  const handSolids = new HandSolids();
+  const flameAudio = new FlameAudio();
+  flameAudio.setEnabled(FLAME_AUDIO_ENABLED);
+  let audioProbes: FieldProbe[] | null = null;
+  let audioProbeBusy = false;
+  let audioProbeAge = AUDIO_PROBE_PERIOD;
+  const unlockAudio = () => {
+    if (FLAME_AUDIO_ENABLED) void flameAudio.resume();
+  };
+  if (FLAME_AUDIO_ENABLED) {
+    window.addEventListener('pointerdown', unlockAudio, { once: true });
+  }
   let volume = new VolumeRenderer(
     { field: solver.renderField, blur: solver.renderBlur, solid: solver.fields.solid },
     params.domainSize,
@@ -153,9 +186,15 @@ async function main() {
   // ---- displacement volumes -----------------------------------------------------------------
   // The proxies ride the rig with the fire so they stay put relative to it in VR, but the gizmo
   // is a mouse tool and belongs in world space alongside the desktop camera.
-  const obstacles = new Obstacles(solver.uniforms, camera, renderer.domElement, (dragging) => {
-    controls.enabled = !dragging;
-  });
+  const obstacles = new Obstacles(
+    solver.uniforms,
+    camera,
+    renderer.domElement,
+    (dragging) => {
+      controls.enabled = !dragging;
+    },
+    MAX_SCENE_OBSTACLES,
+  );
   immersive.attach(obstacles.group);
   scene.add(obstacles.helper);
 
@@ -164,20 +203,19 @@ async function main() {
   immersive.setManipulator(obstacles);
   scene.add(immersive.hud);
 
-  // Seeded before the count callback is wired, so it matches the count the solver was already
-  // built for rather than forcing a rebuild on the first frame. Sized and offset so the plume
-  // wraps past it — a primitive big enough to cap the flame outright shows less than one the
-  // fire gets around.
-  addObstacle('sphere');
-  const seeded = obstacles.targets()[0];
-  seeded.scale.setScalar(0.6);
-  seeded.position.x += 0.1;
-  obstacles.select(null);
+  // Seeded sphere on desktop macOS only — visionOS uses palm boxes instead.
+  if (!isVisionOS()) {
+    addObstacle('sphere');
+    const seeded = obstacles.targets()[0];
+    seeded.scale.setScalar(0.6);
+    seeded.position.x += 0.1;
+    obstacles.select(null);
+  }
 
   // Adding or removing a primitive changes how many are unrolled into the kernels, so the graph
   // has to be rebuilt. Dragging one does not.
   obstacles.onCountChanged = (count) => {
-    params.obstacleCount = count;
+    params.obstacleCount = fireObstacleBudget(count, handSolids.active);
     rebuild();
     refreshGui(gui);
   };
@@ -223,6 +261,61 @@ async function main() {
     return probes;
   }
 
+  function rebuildAudioProbes(): void {
+    if (!FLAME_AUDIO_ENABLED) {
+      audioProbes = null;
+      return;
+    }
+    const g = gridOps(solver.res);
+    const channels = solver.audioProbeChannels();
+    audioProbes = [0, 1].map(
+      (parity) =>
+        new FieldProbe(renderer, g, solver.probeTextures(parity), channels, AUDIO_PROBE_STRIDE),
+    );
+    audioProbeBusy = false;
+    audioProbeAge = AUDIO_PROBE_PERIOD;
+  }
+  rebuildAudioProbes();
+
+  function tickFlameAudio(dt: number): void {
+    if (!FLAME_AUDIO_ENABLED) return;
+    let stir = 0;
+    const slots = solver.uniforms.obstacles;
+    const base = obstacles.count;
+    for (let i = 0; i < MAX_HAND_SOLIDS; i++) {
+      const v = slots[base + i]?.velocity.value;
+      if (v) stir = Math.max(stir, v.length());
+    }
+    for (let i = 0; i < base; i++) {
+      const v = slots[i]?.velocity.value;
+      if (v) stir = Math.max(stir, v.length());
+    }
+    flameAudio.setDrivers({ stir });
+
+    audioProbeAge += dt;
+    const probe = audioProbes?.[solver.currentParity];
+    if (probe && !audioProbeBusy && audioProbeAge >= AUDIO_PROBE_PERIOD) {
+      audioProbeAge = 0;
+      audioProbeBusy = true;
+      void probe
+        .read()
+        .then((stats) => {
+          audioProbeBusy = false;
+          flameAudio.setDrivers({
+            heat: stats.maxHeat?.value ?? 0,
+            temperature: stats.maxTemperature?.value ?? 300,
+            speed: stats.maxSpeed?.value ?? 0,
+            expansion: stats.maxExpansion?.value ?? 0,
+            fuel: stats.maxFuel?.value ?? 0,
+          });
+        })
+        .catch(() => {
+          audioProbeBusy = false;
+        });
+    }
+    flameAudio.update(dt);
+  }
+
   function rebuild() {
     volume.mesh.removeFromParent();
     sparks.mesh.removeFromParent();
@@ -241,6 +334,7 @@ async function main() {
     solver.reset();
     sparks.reset(renderer);
     probes = null;
+    rebuildAudioProbes();
 
     // The reference geometry is sized to the domain, so it is rebuilt rather than reused.
     domainHelper.removeFromParent();
@@ -257,15 +351,10 @@ async function main() {
   }
 
   /**
-   * A session renders the whole scene twice at headset resolution, which is a great deal more
-   * raymarching than a window. Anything above the immersive tier is stepped down for the
-   * duration and put back on exit, since a fire that judders is worse than one with less detail.
+   * A session renders the whole scene twice at headset resolution. Fire drops into a leaner
+   * immersive budget for the duration (see `immersiveFire.ts`) and restores on exit.
    */
-  const IMMERSIVE_QUALITY: Quality = 'performance';
-  /** Raymarch steps while presenting — dual 2048² eyes cannot carry the desktop count. */
-  const IMMERSIVE_RAYMARCH_STEPS = 32;
-  let qualityBeforeXR: Quality | null = null;
-  let raymarchBeforeXR: number | null = null;
+  let budgetBeforeXR: ImmersiveFireSnapshot | null = null;
   /**
    * Frames after the XR target is ready that draw reference geometry only.
    *
@@ -295,21 +384,24 @@ async function main() {
 
   function enterImmersive() {
     controls.enabled = false;
+    unlockAudio();
     // The transform gizmo is a mouse tool, and its thin axis handles are both unusable with a
     // hand ray and squarely in the way of the fire. Pinching a primitive replaces it.
     obstacles.setGizmoEnabled(false);
 
-    const order = QUALITY_TIERS.indexOf(params.quality);
-    if (order < QUALITY_TIERS.indexOf(IMMERSIVE_QUALITY)) {
-      qualityBeforeXR = params.quality;
-      params = applyQuality(params, IMMERSIVE_QUALITY);
-      refreshGui(gui);
-      rebuild();
-    }
-
-    raymarchBeforeXR = params.raymarchSteps;
-    params.raymarchSteps = Math.min(params.raymarchSteps, IMMERSIVE_RAYMARCH_STEPS);
-    volume.update(params, frame);
+    budgetBeforeXR = snapshotFireBudget(params);
+    handSolids.setEnabled(true);
+    params.obstacleCount = fireObstacleBudget(obstacles.count, true);
+    applyImmersiveFireBudget(params);
+    // Rebuild for lean budget and newly reserved palm solid slots.
+    refreshGui(gui);
+    rebuild();
+    immersive.setPlacement({
+      distance: 0.48,
+      height: 0.88,
+      framedSize: IMMERSIVE_FIRE_FRAMED_SIZE,
+      turntable: true,
+    });
     xrWarmupLeft = 20;
     scoped = 0;
 
@@ -317,11 +409,6 @@ async function main() {
       renderer.toneMapping = NoToneMapping;
       renderer.outputColorSpace = LinearSRGBColorSpace;
     }
-
-    // The tier's `xrScale` is deliberately not applied. visionOS quotes a sub-image larger than the
-    // layer it allocates, so `ImmersiveMode` owns the layer scale there — it is measuring its way
-    // up to a texture that can hold the eye, not down to one that is cheap to fill. The tiers pay
-    // in solver resolution and raymarch steps instead.
   }
 
   function exitImmersive() {
@@ -329,22 +416,28 @@ async function main() {
     obstacles.setGizmoEnabled(true);
     applyPixelRatio(params.quality);
     xrWarmupLeft = 0;
+    handSolids.setEnabled(false);
+    params.obstacleCount = fireObstacleBudget(obstacles.count, false);
 
     if (flatXR) {
       renderer.toneMapping = ACESFilmicToneMapping;
       renderer.outputColorSpace = SRGBColorSpace;
     }
 
-    if (raymarchBeforeXR !== null) {
-      params.raymarchSteps = raymarchBeforeXR;
-      raymarchBeforeXR = null;
-      volume.update(params, frame);
-    }
+    immersive.setPlacement({
+      distance: 0.48,
+      height: 0.88,
+      framedSize: 0.42,
+      turntable: true,
+    });
 
-    if (qualityBeforeXR) {
-      params = applyQuality(params, qualityBeforeXR);
-      qualityBeforeXR = null;
+    if (budgetBeforeXR) {
+      const snap = budgetBeforeXR;
+      budgetBeforeXR = null;
+      restoreFireBudget(params, snap);
       refreshGui(gui);
+      rebuild();
+    } else {
       rebuild();
     }
   }
@@ -416,9 +509,14 @@ async function main() {
       onStructuralChange: rebuild,
       onPreset: (preset: Preset) => {
         params = applyPreset(params, preset);
+        params.environment = 'night';
+        params.backgroundIntensity = DEFAULT_INTENSITY.night;
+        params.obstacleCount = fireObstacleBudget(obstacles.count, handSolids.active);
         gui.destroy();
         gui = createGui(params, callbacks());
         refreshGui(gui);
+        void environment.set('night');
+        environment.setIntensity(DEFAULT_INTENSITY.night);
         rebuild();
         setCamera(preset);
       },
@@ -634,9 +732,18 @@ async function main() {
       // Before the step, so the velocity a dragged primitive picked up this frame is the boundary
       // flux the projection sees rather than one frame stale.
       obstacles.update(dt);
-      // Stereo raymarching already owns the frame; step the solver every other tick in a session.
-      if (!immersive.active || frame % 2 === 0) {
-        solver.step(dt);
+      handSolids.update(
+        solver.uniforms,
+        obstacles.count,
+        immersive.contentRoot,
+        renderer,
+        immersive.active ? xrFrame : undefined,
+        dt,
+      );
+      // Stereo raymarching already owns the frame; throttle the Euler solve in a session.
+      const interval = IMMERSIVE_FIRE_SOLVE_INTERVAL;
+      if (!immersive.active || frame % interval === 0) {
+        solver.step(immersive.active ? dt * interval : dt);
       }
       volume.update(params, frame++);
 
@@ -647,6 +754,7 @@ async function main() {
       if (params.sparksEnabled && !immersive.active) {
         sparks.step(renderer, solver.currentParity, dt, frame);
       }
+      tickFlameAudio(dt);
     } else if (!stripped) {
       // Warmup still needs the volume's uniforms current for the compile/draw.
       volume.update(params, frame);

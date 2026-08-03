@@ -22,8 +22,13 @@ const { float, vec3, cross, length, max, min } = T;
  *
  * The count actually built into a frame is the number in use, not this — adding or removing one
  * recompiles the graph, so an unused slot costs nothing. This is only the ceiling.
+ *
+ * Scene gizmo colliders and tracked-hand palm boxes share this pool. Hand slots are reserved at
+ * the end of the list so adding/removing a scene primitive does not stomp live hand poses.
  */
-export const MAX_OBSTACLES = 4;
+export const MAX_SCENE_OBSTACLES = 4;
+export const MAX_HAND_SOLIDS = 2;
+export const MAX_OBSTACLES = MAX_SCENE_OBSTACLES + MAX_HAND_SOLIDS;
 
 export type ObstacleKind = 'sphere' | 'box' | 'capsule';
 

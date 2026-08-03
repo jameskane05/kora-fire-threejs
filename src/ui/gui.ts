@@ -2,7 +2,7 @@ import GUI from 'lil-gui';
 import { DEBUG_CHANNELS } from '../render/VolumeRenderer';
 import { FUELS } from '../sim/constants';
 import type { KoraParams } from '../sim/params';
-import { MAX_OBSTACLES, type GizmoMode, type ObstacleKind } from '../sim/obstacles';
+import { MAX_SCENE_OBSTACLES, type GizmoMode, type ObstacleKind } from '../sim/obstacles';
 import { ENVIRONMENTS, type EnvironmentName } from '../scene/Environment';
 import { PRESETS, type Preset } from './presets';
 import { QUALITY, QUALITY_TIERS, type Quality } from './quality';
@@ -217,7 +217,7 @@ export function createGui(
   );
   tip(
     ect
-      .add(params, 'energyCascadeBands', 1, 5, 1)
+      .add(params, 'energyCascadeBands', 0, 5, 1)
       .name('frequency bands')
       .onChange(() => cb.onStructuralChange()),
     'How many successive filter scales (l = 2ⁿ dx) participate. More bands ⇒ richer multi-scale motion; rebuilds the graph.',
@@ -313,12 +313,18 @@ export function createGui(
     'Cheap ambient in-scatter on soot (self-shadowed via blurred soot). Not scene lighting — just enough for the plume to read as volume.',
   );
   tip(
-    render.add(params, 'koraDiffusion', 0, 1, 0.01).name('Kora diffusion (§5.4.2)'),
-    '§5.4.2 — Blend blurred temperature back into shading. Exaggerates radiative cooling on the outer shell.',
+    render
+      .add(params, 'koraDiffusion', 0, 1, 0.01)
+      .name('Kora diffusion (§5.4.2)')
+      .onChange(() => cb.onStructuralChange()),
+    '§5.4.2 — Blend blurred temperature back into shading. Exaggerates radiative cooling on the outer shell. Rebuilds the graph (render-blur pyramid).',
   );
   tip(
-    render.add(params, 'koraCrust', 0, 1.5, 0.01).name('Kora crust (§5.4.2)'),
-    '§5.4.2 — Emphasise convex soot (blurred soot subtracted from local). Dark crust with cracks where the emissive core shows through.',
+    render
+      .add(params, 'koraCrust', 0, 1.5, 0.01)
+      .name('Kora crust (§5.4.2)')
+      .onChange(() => cb.onStructuralChange()),
+    '§5.4.2 — Emphasise convex soot (blurred soot subtracted from local). Dark crust with cracks where the emissive core shows through. Rebuilds the graph (render-blur pyramid).',
   );
   tip(render.add(params, 'bloom', 0, 2, 0.01).name('bloom'), 'Screen-space bloom strength on the hot fire. Disabled in XR (projection-layer limitation).');
   tip(
@@ -393,7 +399,7 @@ export function createGui(
       capsule: () => cb.onAddObstacle('capsule'),
       remove: () => cb.onRemoveObstacle(),
     };
-    tip(solids.add(shapes, 'sphere').name(`add sphere (max ${MAX_OBSTACLES})`), 'Drop a sphere just above the emitter. Rebuilds the solver for the new primitive count.');
+    tip(solids.add(shapes, 'sphere').name(`add sphere (max ${MAX_SCENE_OBSTACLES})`), 'Drop a sphere just above the emitter. Rebuilds the solver for the new primitive count.');
     tip(solids.add(shapes, 'box').name('add box'), 'Add a box obstacle in the plume.');
     tip(solids.add(shapes, 'capsule').name('add capsule'), 'Add a capsule obstacle in the plume.');
     tip(solids.add(shapes, 'remove').name('remove selected'), 'Remove the gizmo-selected primitive.');

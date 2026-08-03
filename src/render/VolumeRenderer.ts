@@ -105,6 +105,8 @@ export class VolumeRenderer {
     smokeAmbient: uniform(0.16),
     koraDiffusion: uniform(0.35),
     koraCrust: uniform(0.3),
+    /** 1 when the solver built a render-blur pyramid (Kora look on). */
+    useRenderBlur: uniform(0),
     showFlameFront: uniform(0),
     frame: uniform(0),
     /** 0 = shaded, otherwise a max-intensity projection of one raw channel */
@@ -203,12 +205,16 @@ export class VolumeRenderer {
 
       const ds = tFar.sub(tNear).div(u.steps).toVar();
 
-      // interleaved-gradient jitter, re-seeded each frame, trading banding for a little noise
-      const jitter = screenCoordinate.x
+      // Stronger screen-space hash + golden-ratio temporal phase. With low step counts (XR)
+      // the old linear IGN collapsed into visible bands; this trades a little grain for less
+      // structured stair-stepping, including across stereo eyes.
+      const pixelHash = screenCoordinate.x
         .mul(0.06711056)
         .add(screenCoordinate.y.mul(0.00583715))
-        .add(u.frame.mul(0.6180339))
+        .fract()
+        .mul(52.9829189)
         .fract();
+      const jitter = pixelHash.add(u.frame.mul(0.61803398875)).fract();
 
       const extent = u.boxMax.sub(u.boxMin);
       const transmittance = float(1.0).toVar();
@@ -241,24 +247,24 @@ export class VolumeRenderer {
         });
 
         const s = texture3D(inputs.field, uvw).level(int(0));
-        const b = texture3D(inputs.blur, uvw).level(int(0));
 
-        const temperature = s.x;
+        const temperature = s.x.toVar();
         const heat = s.y;
-        const soot = s.z;
+        const soot = s.z.toVar();
         const equivalence = s.w;
 
-        // ---- §5.4.2 Kora diffusion -------------------------------------------------------
-        // Blend the multi-level blurred temperature back in: the hot interior mixes with the
-        // cooler surrounding air, dropping the temperature along the outer shell and
-        // exaggerating the appearance of radiative cooling.
-        const shadedTemperature = mix(temperature, b.x, u.koraDiffusion);
-
-        // ---- §5.4.2 Kora crust -----------------------------------------------------------
-        // Blurred soot subtracted from the original isolates convex regions of the shell; the
-        // resulting layer darkens it while the emissive core shines through the concave cracks.
-        const relief = max(soot.sub(b.z), float(0.0));
-        const shadedSoot = max(soot.add(relief.mul(u.koraCrust).mul(4.0)), float(0.0));
+        // Blurred channels for §5.4.2 + cheap self-shadow. Skipped when the solver did not
+        // build the pyramid (XR lean / Kora look off) so stereo fill avoids a dead fetch.
+        const shadedTemperature = temperature.toVar();
+        const shadedSoot = soot.toVar();
+        const occlusionSoot = soot.toVar();
+        If(u.useRenderBlur.greaterThan(float(0.5)), () => {
+          const b = texture3D(inputs.blur, uvw).level(int(0));
+          shadedTemperature.assign(mix(temperature, b.x, u.koraDiffusion));
+          const relief = max(soot.sub(b.z), float(0.0));
+          shadedSoot.assign(max(soot.add(relief.mul(u.koraCrust).mul(4.0)), float(0.0)));
+          occlusionSoot.assign(b.z);
+        });
 
         // ---- §5.4.1 flame alpha ------------------------------------------------------------
         // eq. (41): zeta = (1 - (2 phi - 1)^4) H, suppressing H near phi = 0 and phi = 1 so
@@ -318,10 +324,8 @@ export class VolumeRenderer {
         // the fire brighter and never reads as smoke.
         const sootShare = sootSigma.div(max(sigma, float(1e-6)));
 
-        // Cheap self-shadowing: the blurred soot doubles as an occlusion estimate, so deep
-        // smoke sits in shadow without paying for a per-step shadow ray. Scale with sootDensity
-        // so the occlusion estimate tracks the same extinction the march uses.
-        const shadow = exp(b.z.mul(u.sootDensity).mul(-0.045));
+        // Cheap self-shadowing: blurred soot when available, else raw soot (XR lean path).
+        const shadow = exp(occlusionSoot.mul(u.sootDensity).mul(-0.045));
         const sootGrey = vec3(0.12, 0.11, 0.1);
         const sunBleed = vec3(0.35, 0.28, 0.18).mul(shadow);
         const scattered = sootGrey.add(sunBleed).mul(u.smokeAmbient).mul(u.sootAlbedo);
@@ -359,6 +363,7 @@ export class VolumeRenderer {
     u.smokeAmbient.value = params.smokeAmbient;
     u.koraDiffusion.value = params.koraDiffusion;
     u.koraCrust.value = params.koraCrust;
+    u.useRenderBlur.value = params.koraDiffusion > 0 || params.koraCrust > 0 ? 1 : 0;
     u.showFlameFront.value = params.showFlameFront ? 1 : 0;
     u.debugChannel.value = DEBUG_CHANNELS.indexOf(params.debugView);
     u.debugScale.value = params.debugScale;

@@ -3,28 +3,45 @@
  */
 import { Scene, Vector3, type PerspectiveCamera, type WebGPURenderer } from 'three/webgpu';
 import type GUI from 'lil-gui';
+import { FLAME_AUDIO_ENABLED, FlameAudio } from '../audio/FlameAudio';
 import { KoraSolver } from '../sim/KoraSolver';
 import { createNoiseVolume, type NoiseVolume } from '../sim/noise';
 import { defaultParams, type KoraParams } from '../sim/params';
 import type { ObstacleKind } from '../sim/obstacles';
+import { FieldProbe } from '../sim/probe';
+import { gridOps } from '../sim/tsl';
 import { VolumeRenderer } from '../render/VolumeRenderer';
 import { PRESETS, applyPreset, type Preset } from '../ui/presets';
-import { QUALITY, QUALITY_TIERS, applyQuality, type Quality } from '../ui/quality';
+import { QUALITY, type Quality } from '../ui/quality';
+import {
+  IMMERSIVE_FIRE_BUDGET,
+  IMMERSIVE_FIRE_FRAMED_SIZE,
+  applyImmersiveFireBudget,
+  IMMERSIVE_FIRE_SOLVE_INTERVAL,
+} from '../ui/immersiveFire';
 import { createGui, refreshGui } from '../ui/gui';
 import { Sparks } from '../particles/Sparks';
 import { Obstacles, type GizmoMode } from '../scene/Obstacles';
 import { DEFAULT_INTENSITY, type Environment, type EnvironmentName } from '../scene/Environment';
 import type { ImmersiveMode } from '../xr/ImmersiveMode';
+import { HandSolids, MAX_HAND_SOLIDS } from '../xr/HandSolids';
+import { isVisionOS } from '../xr/platform';
+import { MAX_SCENE_OBSTACLES } from '../sim/obstacles';
 
-/** Immersive floor: dual ~2k eyes cannot carry desktop raymarch or a high quality tier. */
-const IMMERSIVE_QUALITY: Quality = 'performance';
-const IMMERSIVE_RAYMARCH_STEPS = 32;
+function fireObstacleBudget(sceneCount: number, hands: boolean): number {
+  return sceneCount + (hands ? MAX_HAND_SOLIDS : 0);
+}
 
+/** How often to pull lean field extremes for the audio bus (seconds). */
+const AUDIO_PROBE_PERIOD = 0.12;
+/** Coarse voxel stride — audio only needs a rough max. */
+const AUDIO_PROBE_STRIDE = 8;
+
+/** Match MPM tabletop so fire sits in the lap, not mid-air in front of you. */
 export const FIRE_PLACEMENT = {
-  distance: 1.15,
-  height: 1.25,
-  /** Smaller on-screen footprint than the old 0.85 — raymarch cost scales with fragments. */
-  framedSize: 0.5,
+  distance: 0.48,
+  height: 0.88,
+  framedSize: 0.42,
   /** Same as sand/goo/water: pinch is for colliders, not spinning the domain. */
   turntable: false,
 } as const;
@@ -35,16 +52,25 @@ export class FireExhibit {
   private sparks: Sparks | null = null;
   private noise: NoiseVolume | null = null;
   private obstacles: Obstacles | null = null;
-  private params: KoraParams = applyQuality(
-    applyPreset({ ...defaultParams }, PRESETS[0]),
-    'performance',
-  );
+  private readonly handSolids = new HandSolids();
+  private readonly audio = new FlameAudio();
+  private audioProbes: FieldProbe[] | null = null;
+  private audioProbeBusy = false;
+  private audioProbeAge = 0;
+  private params: KoraParams = (() => {
+    const p = applyPreset({ ...defaultParams }, PRESETS[0]);
+    // Sandbox is AVP-first: lean budget from first build, not desktop performance (64³).
+    applyImmersiveFireBudget(p);
+    p.environment = 'night';
+    p.backgroundIntensity = DEFAULT_INTENSITY.night;
+    // Desktop keeps a seeded sphere; visionOS skips it (palms are the interactive solids).
+    p.obstacleCount = fireObstacleBudget(isVisionOS() ? 0 : 1, false);
+    return p;
+  })();
   private gui: GUI | null = null;
   private frame = 0;
   private active = false;
   private ready = false;
-  private qualityBeforeXR: Quality | null = null;
-  private raymarchBeforeXR: number | null = null;
   private readonly onKeyDown = (e: KeyboardEvent) => {
     if (!this.active) return;
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -115,17 +141,27 @@ export class FireExhibit {
     this.active = on;
     this.setVisible(on);
     this.setGuiVisible(on);
+    this.audio.setEnabled(on);
     if (on) {
+      // Selecting Fire from the toolbar must land on the lean budget (GUI shows 48, not 64).
+      if (this.enforceLeanBudget()) this.rebuild();
+      else if (this.gui) refreshGui(this.gui);
       this.immersive.setDomainSize(this.params.domainSize);
-      this.immersive.setPlacement({ ...FIRE_PLACEMENT });
+      this.immersive.setPlacement(this.placementForSession());
       this.environment.setIntensity(this.params.backgroundIntensity);
       void this.environment.set(this.params.environment);
       this.obstacles?.setGizmoEnabled(!this.immersive.active);
       if (this.obstacles) this.immersive.setManipulator(this.obstacles);
+      void this.audio.resume();
     } else {
       // Keep selection so re-entering fire re-attaches the gizmo to the same collider.
       this.obstacles?.setGizmoEnabled(false);
     }
+  }
+
+  /** Unlock the AudioContext from a user gesture (toolbar click / Enter VR). */
+  resumeAudio(): void {
+    void this.audio.resume();
   }
 
   reset(): void {
@@ -139,52 +175,55 @@ export class FireExhibit {
     if (!this.volume) return;
     this.obstacles?.setGizmoEnabled(false);
 
-    // Match fire.html: step the tier down for the session. Raymarch alone is not enough if the
-    // GUI was left on high/balanced (96³ + MacCormack survives otherwise).
-    const order = QUALITY_TIERS.indexOf(this.params.quality);
-    if (order < QUALITY_TIERS.indexOf(IMMERSIVE_QUALITY)) {
-      this.qualityBeforeXR = this.params.quality;
-      this.params = applyQuality(this.params, IMMERSIVE_QUALITY);
+    // Budget is always lean in the sandbox; re-assert in case the GUI was twiddled.
+    const handsChanged = this.setHandSlots(true);
+    if (this.enforceLeanBudget() || handsChanged) {
       this.rebuild();
       if (this.gui) refreshGui(this.gui);
+    } else {
+      this.volume.update(this.params, this.frame);
+      if (this.gui) refreshGui(this.gui);
     }
+    this.immersive.setPlacement({ ...FIRE_PLACEMENT, framedSize: IMMERSIVE_FIRE_FRAMED_SIZE });
 
-    this.raymarchBeforeXR = this.params.raymarchSteps;
-    this.params.raymarchSteps = Math.min(this.params.raymarchSteps, IMMERSIVE_RAYMARCH_STEPS);
-    this.volume?.update(this.params, this.frame);
-
-    // Sparks are a second dual-eye pass the session cannot afford (same policy as fire.html).
     if (this.sparks) this.sparks.mesh.visible = false;
+    void this.audio.resume();
   }
 
   exitImmersive(): void {
     if (this.active) this.obstacles?.setGizmoEnabled(true);
-
-    if (this.raymarchBeforeXR !== null) {
-      this.params.raymarchSteps = this.raymarchBeforeXR;
-      this.raymarchBeforeXR = null;
-      this.volume?.update(this.params, this.frame);
-    }
-
-    if (this.qualityBeforeXR) {
-      this.params = applyQuality(this.params, this.qualityBeforeXR);
-      this.qualityBeforeXR = null;
-      this.rebuild();
-      if (this.gui) refreshGui(this.gui);
-    }
-
+    // Drop palm solid slots so flat rendering stops paying bake/pressure for parked hands.
+    if (this.setHandSlots(false)) this.rebuild();
+    // Stay on the lean sandbox budget — do not restore desktop 64³.
+    this.immersive.setPlacement({ ...FIRE_PLACEMENT });
     if (this.sparks) this.sparks.mesh.visible = this.active && this.params.sparksEnabled;
   }
 
-  step(dt: number): void {
+  step(dt: number, xrFrame?: XRFrame): void {
     if (!this.active || !this.solver || !this.volume || !this.sparks) return;
     this.obstacles?.update(dt);
-    this.solver.step(dt);
+    // Hands → reserved solid slots after scene colliders. Parks when not in XR / no joints.
+    if (this.obstacles) {
+      this.handSolids.update(
+        this.solver.uniforms,
+        this.obstacles.count,
+        this.immersive.contentRoot,
+        this.renderer,
+        this.immersive.active ? xrFrame : undefined,
+        dt,
+      );
+    }
+    // Stereo raymarch owns the frame; throttle the Euler solve while presenting.
+    const interval = IMMERSIVE_FIRE_SOLVE_INTERVAL;
+    if (!this.immersive.active || this.frame % interval === 0) {
+      this.solver.step(this.immersive.active ? dt * interval : dt);
+    }
     this.volume.update(this.params, this.frame);
     // Dual-eye overdraw for embers is dropped while presenting.
     if (this.params.sparksEnabled && !this.immersive.active) {
       this.sparks.step(this.renderer, this.solver.currentParity, dt, this.frame);
     }
+    this.tickAudio(dt);
     this.frame++;
   }
 
@@ -192,6 +231,7 @@ export class FireExhibit {
     window.removeEventListener('keydown', this.onKeyDown);
     this.gui?.destroy();
     this.gui = null;
+    this.audio.dispose();
     this.teardownSolver();
     this.noise = null;
     this.ready = false;
@@ -208,20 +248,39 @@ export class FireExhibit {
 
   private callbacks() {
     return {
-      onStructuralChange: () => this.rebuild(),
+      onStructuralChange: () => {
+        // Keep headset knobs pinned; free edits to look params still rebuild.
+        this.enforceLeanBudget();
+        this.rebuild();
+        if (this.gui) refreshGui(this.gui);
+      },
       onPreset: (preset: Preset) => {
+        const obstacles = this.obstacles?.count ?? 1;
         this.params = applyPreset(this.params, preset);
+        this.enforceLeanBudget();
+        this.params.environment = 'night';
+        this.params.backgroundIntensity = DEFAULT_INTENSITY.night;
+        this.params.obstacleCount = fireObstacleBudget(obstacles, this.handSolids.active);
         this.rebuild();
         this.mountGui();
+        void this.environment.set('night');
+        this.environment.setIntensity(DEFAULT_INTENSITY.night);
         refreshGui(this.gui!);
       },
-      onReset: () => this.rebuild(),
+      onReset: () => {
+        this.enforceLeanBudget();
+        this.rebuild();
+        if (this.gui) refreshGui(this.gui);
+      },
       onDetonate: () => this.solver?.detonate(1.0),
       onProbe: () => undefined,
       onProfile: () => undefined,
-      onQuality: (q: Quality) => {
-        this.params = applyQuality(this.params, q);
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, QUALITY[q].pixelRatio));
+      onQuality: (_q: Quality) => {
+        // Quality tiers would yank resolution back to 64/80/96 — sandbox ignores them for cost.
+        this.enforceLeanBudget();
+        this.renderer.setPixelRatio(
+          Math.min(window.devicePixelRatio, QUALITY[IMMERSIVE_FIRE_BUDGET.quality].pixelRatio),
+        );
         this.rebuild();
         refreshGui(this.gui!);
       },
@@ -251,20 +310,42 @@ export class FireExhibit {
     this.obstacles.add(kind, at);
   }
 
+  /** Pin cost knobs; returns whether the compute graph needs a rebuild. */
+  private enforceLeanBudget(): boolean {
+    return applyImmersiveFireBudget(this.params);
+  }
+
+  /** XR-only palm spheres. Returns true when obstacleCount changed (needs rebuild). */
+  private setHandSlots(on: boolean): boolean {
+    if (this.handSolids.active === on) return false;
+    this.handSolids.setEnabled(on);
+    this.params.obstacleCount = fireObstacleBudget(this.obstacles?.count ?? 1, on);
+    return true;
+  }
+
+  private placementForSession(): typeof FIRE_PLACEMENT & { framedSize: number } {
+    return {
+      ...FIRE_PLACEMENT,
+      framedSize: this.immersive.active ? IMMERSIVE_FIRE_FRAMED_SIZE : FIRE_PLACEMENT.framedSize,
+    };
+  }
+
   private rebuild(): void {
     const wasVisible = this.active;
+    this.enforceLeanBudget();
     this.teardownSolver();
     this.buildSolver();
     this.setVisible(wasVisible);
     if (wasVisible) {
       this.immersive.setDomainSize(this.params.domainSize);
-      this.immersive.setPlacement({ ...FIRE_PLACEMENT });
+      this.immersive.setPlacement(this.placementForSession());
       if (this.obstacles) this.immersive.setManipulator(this.obstacles);
     }
   }
 
   private buildSolver(): void {
     if (!this.noise) this.noise = createNoiseVolume(32);
+    this.enforceLeanBudget();
     this.solver = new KoraSolver(this.renderer, this.params, this.noise);
     this.volume = new VolumeRenderer(
       {
@@ -292,21 +373,23 @@ export class FireExhibit {
         this.camera,
         this.renderer.domElement,
         this.onGizmoDrag,
+        MAX_SCENE_OBSTACLES,
       );
       this.immersive.attach(this.obstacles.group);
       this.scene.add(this.obstacles.helper);
-      // Seed before wiring count→rebuild, or the first add would recurse into buildSolver.
-      this.addObstacle('sphere');
-      const seeded = this.obstacles.targets()[0];
-      if (seeded) {
-        seeded.scale.setScalar(0.6);
-        seeded.position.x += 0.1;
+      // Seeded sphere on desktop macOS only — visionOS uses palm boxes instead.
+      if (!isVisionOS()) {
+        this.addObstacle('sphere');
+        const seeded = this.obstacles.targets()[0];
+        if (seeded) {
+          seeded.scale.setScalar(0.6);
+          seeded.position.x += 0.1;
+        }
       }
-      // Leave the gizmo on the seeded sphere — select(null) parks the helper at the scene origin.
       this.obstacles.setMode(this.params.gizmoMode);
-      this.params.obstacleCount = this.obstacles.count;
+      this.params.obstacleCount = fireObstacleBudget(this.obstacles.count, this.handSolids.active);
       this.obstacles.onCountChanged = (count) => {
-        this.params.obstacleCount = count;
+        this.params.obstacleCount = fireObstacleBudget(count, this.handSolids.active);
         this.rebuild();
         if (this.gui) refreshGui(this.gui);
       };
@@ -322,6 +405,25 @@ export class FireExhibit {
     this.immersive.attach(this.volume.mesh);
     this.immersive.attach(this.sparks.mesh);
 
+    if (FLAME_AUDIO_ENABLED) {
+      const g = gridOps(this.solver.res);
+      const channels = this.solver.audioProbeChannels();
+      this.audioProbes = [0, 1].map(
+        (parity) =>
+          new FieldProbe(
+            this.renderer,
+            g,
+            this.solver!.probeTextures(parity),
+            channels,
+            AUDIO_PROBE_STRIDE,
+          ),
+      );
+      this.audioProbeBusy = false;
+      this.audioProbeAge = AUDIO_PROBE_PERIOD;
+    } else {
+      this.audioProbes = null;
+    }
+
     this.solver.reset();
     this.sparks.reset(this.renderer);
     this.frame = 0;
@@ -336,7 +438,49 @@ export class FireExhibit {
     this.solver = null;
     this.volume = null;
     this.sparks = null;
+    this.audioProbes = null;
     // Keep obstacles across rebuilds (same as fire main) — only unbind via bind() on next build.
+  }
+
+  private tickAudio(dt: number): void {
+    if (!FLAME_AUDIO_ENABLED || !this.solver || !this.obstacles) return;
+
+    let stir = 0;
+    const slots = this.solver.uniforms.obstacles;
+    const base = this.obstacles.count;
+    for (let i = 0; i < MAX_HAND_SOLIDS; i++) {
+      const v = slots[base + i]?.velocity.value;
+      if (v) stir = Math.max(stir, v.length());
+    }
+    for (let i = 0; i < base; i++) {
+      const v = slots[i]?.velocity.value;
+      if (v) stir = Math.max(stir, v.length());
+    }
+    this.audio.setDrivers({ stir });
+
+    this.audioProbeAge += dt;
+    const probe = this.audioProbes?.[this.solver.currentParity];
+    if (probe && !this.audioProbeBusy && this.audioProbeAge >= AUDIO_PROBE_PERIOD) {
+      this.audioProbeAge = 0;
+      this.audioProbeBusy = true;
+      void probe
+        .read()
+        .then((stats) => {
+          this.audioProbeBusy = false;
+          this.audio.setDrivers({
+            heat: stats.maxHeat?.value ?? 0,
+            temperature: stats.maxTemperature?.value ?? 300,
+            speed: stats.maxSpeed?.value ?? 0,
+            expansion: stats.maxExpansion?.value ?? 0,
+            fuel: stats.maxFuel?.value ?? 0,
+          });
+        })
+        .catch(() => {
+          this.audioProbeBusy = false;
+        });
+    }
+
+    this.audio.update(dt);
   }
 
   private setGuiVisible(on: boolean): void {

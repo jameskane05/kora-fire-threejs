@@ -179,7 +179,10 @@ async function main() {
       controls.enabled = false;
       forceColliders.setGizmoEnabled(false);
       xrWarmupFrames = 20;
-      if (exhibit === 'fire') fire.enterImmersive();
+      if (exhibit === 'fire') {
+        fire.resumeAudio();
+        fire.enterImmersive();
+      }
     },
     onExit: () => {
       controls.enabled = true;
@@ -501,11 +504,15 @@ async function main() {
       hud.setExhibit('fire');
       setActive('mat-fire');
       setDesktopCamera('fire');
+      // Selecting Fire mid-session used to skip enterImmersive — lean placement / sparks hide
+      // never ran. Always sync when already presenting.
+      if (immersive.active) fire.enterImmersive();
       syncGuiVisibility();
       statsDirty = true;
       return;
     }
 
+    if (exhibit === 'fire' && immersive.active) fire.exitImmersive();
     fire.setActive(false);
     immersive.setDomainSize(DOMAIN);
     immersive.setPlacement({ ...MPM_PLACEMENT });
@@ -600,7 +607,7 @@ async function main() {
     const skipSim = immersive.active && xrWarmupFrames > 0 && !immersive.rendering;
     if (!skipSim) {
       if (exhibit === 'fire') {
-        fire.step(dt);
+        fire.step(dt, xrFrame);
       } else {
         const forces = gatherForces(xrFrame);
         if (!beadCopyPos) beadCopyPos = attrGpuBuffer(posAttr);

@@ -25,7 +25,7 @@ import {
 import { abs, color, dot, mix, normalView, oneMinus, positionViewDirection, pow, uniform } from 'three/tsl';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import {
-  MAX_OBSTACLES,
+  MAX_SCENE_OBSTACLES,
   baseGeometry,
   type GizmoMode,
   type ObstacleKind,
@@ -120,6 +120,8 @@ export class Obstacles {
     private readonly camera: Camera,
     private readonly domElement: HTMLElement,
     onDragging: (dragging: boolean) => void,
+    /** Caps user-placed primitives so reserved hand-solid slots stay free. */
+    private readonly maxItems: number = MAX_SCENE_OBSTACLES,
   ) {
     this.uniforms = uniforms;
 
@@ -181,7 +183,7 @@ export class Obstacles {
   }
 
   add(kind: ObstacleKind, at: Vector3): boolean {
-    if (this.items.length >= MAX_OBSTACLES) return false;
+    if (this.items.length >= this.maxItems) return false;
 
     const size = 0.5;
     const highlight = uniform(0);

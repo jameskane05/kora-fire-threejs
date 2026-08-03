@@ -15,8 +15,9 @@
  *    driven by `XRSession.requestAnimationFrame` and not by the window's.
  *
  * Navigation is deliberately object-centric rather than viewer-centric: one pinch turns the
- * domain in front of you; two pinches pan it on the table. Moving the viewer instead would be
- * both more work and, on a device with no thumbsticks, a good way to make someone ill.
+ * domain (when turntable is on); two pinches pan from wrist travel and scale from inter-hand
+ * distance. Moving the viewer instead would be both more work and, on a device with no
+ * thumbsticks, a good way to make someone ill.
  */
 import {
   Group,
@@ -32,14 +33,23 @@ import { ModePanel } from './ModePanel';
 import type { GizmoMode } from '../scene/Obstacles';
 
 /** Where the domain is placed relative to the viewer, in metres. */
-const DEFAULT_PLACEMENT = { distance: 1.15, height: 1.25 };
+/** Lap / tabletop default — matches materials + sandbox fire. */
+const DEFAULT_PLACEMENT = { distance: 0.48, height: 0.88 };
 
 /** The domain's largest dimension is scaled to this, so every preset frames the same way. */
-const DEFAULT_FRAMED_SIZE = 0.9;
+const DEFAULT_FRAMED_SIZE = 0.42;
 
-/** Two-handed pinch pans the rig; gain on average hand travel in metres. */
-const PAN_GAIN = 1.35;
+/**
+ * Two-handed pinch pans the rig from wrist travel and scales framedSize from inter-hand
+ * distance (not target-ray origin). visionOS transient pointers are shoulder-anchored, so
+ * ray origins barely move when you pull both hands toward yourself — wrists do.
+ */
+const PAN_GAIN = 1.15;
 const PAN_LIMIT = { x: 0.7, y: 0.45, z: 0.55 };
+
+/** Two-hand pinch: pull apart / pinch together scales `framedSize` (rig world size). */
+const FRAMED_SIZE_MIN = 0.14;
+const FRAMED_SIZE_MAX = 0.95;
 
 /**
  * When the session is head-origin (`local`) rather than floor-origin, floor-relative heights are
@@ -348,6 +358,8 @@ export class ImmersiveMode {
   private readonly anchorForward = new Vector3(0, 0, -1);
   /** Extra translation from two-handed pan, in metres (reference space). */
   private readonly panOffset = new Vector3();
+  /** Baseline for two-hand domain scale (pull apart → larger framedSize). */
+  private domainScaleGesture: { startDist: number; startFramed: number } | null = null;
   private button: HTMLButtonElement | null = null;
   private session: XRSession | null = null;
   private presenting = false;
@@ -780,6 +792,11 @@ export class ImmersiveMode {
   }
 
   /** Reparents an object into the rotating group. */
+  /** Domain / obstacle parent — hand joints must be transformed into this space for fire solids. */
+  get contentRoot(): Object3D {
+    return this.content;
+  }
+
   attach(object: Object3D): void {
     this.content.add(object);
   }
@@ -795,8 +812,8 @@ export class ImmersiveMode {
   }
 
   /**
-   * Where the domain sits in XR and how large it frames. Materials uses a near tabletop;
-   * fire keeps the default mid-air placement.
+   * Where the domain sits in XR and how large it frames. Default is lap/tabletop;
+   * exhibits can override distance / height / framedSize / turntable.
    */
   setPlacement(options: PlacementOptions): void {
     if (options.distance !== undefined) this.placement.distance = options.distance;
@@ -1071,6 +1088,7 @@ export class ImmersiveMode {
     // onEnter picks the immersive quality tier, which is where the layer scale comes from, so the
     // shim has to go in after it and before three builds the layer inside setSession.
     this.panOffset.set(0, 0, 0);
+    this.domainScaleGesture = null;
     this.pendingAnchor = true;
     this.velocity.yaw = 0;
     this.velocity.pitch = 0;
@@ -1278,6 +1296,45 @@ export class ImmersiveMode {
     if (!this.grab.twoHand) this.grab.beginTwoHandScale(distance);
     else this.grab.moveTwoHandScale(distance);
     return true;
+  }
+
+  /**
+   * Two transient-pointer pinches (empty space): pull hands apart to grow the domain, pinch
+   * together to shrink. Uses wrist distance so shoulder-anchored rays don't mute the gesture.
+   */
+  private syncTwoHandDomainScale(frame: XRFrame, referenceSpace: XRReferenceSpace): void {
+    const hands: Drag[] = [];
+    for (const drag of this.drags.values()) {
+      if (drag.kind === 'turntable') hands.push(drag);
+      if (hands.length >= 2) break;
+    }
+    if (hands.length < 2) {
+      this.domainScaleGesture = null;
+      return;
+    }
+    if (
+      !this.readWrist(hands[0].source, frame, referenceSpace, wristA) ||
+      !this.readWrist(hands[1].source, frame, referenceSpace, wristB)
+    ) {
+      return;
+    }
+
+    const dist = wristA.distanceTo(wristB);
+    if (dist < 1e-4) return;
+
+    if (!this.domainScaleGesture) {
+      this.domainScaleGesture = { startDist: dist, startFramed: this.framedSize };
+      return;
+    }
+
+    const ratio = dist / this.domainScaleGesture.startDist;
+    const next = Math.max(
+      FRAMED_SIZE_MIN,
+      Math.min(FRAMED_SIZE_MAX, this.domainScaleGesture.startFramed * ratio),
+    );
+    if (Math.abs(next - this.framedSize) < 1e-4) return;
+    this.framedSize = next;
+    this.layout();
   }
 
   /**
@@ -1500,10 +1557,11 @@ export class ImmersiveMode {
       z: 0,
     });
 
-    // Second pinch: drop into pan and re-origin both hands so the turntable doesn't keep spinning.
+    // Second pinch: drop into pan+scale and re-origin both hands so the turntable doesn't keep spinning.
     if (kind === 'turntable' && this.turntableCount() >= 2) {
       this.velocity.yaw = 0;
       this.velocity.pitch = 0;
+      this.domainScaleGesture = null;
       for (const drag of this.drags.values()) {
         if (drag.kind === 'turntable') drag.started = false;
       }
@@ -1551,7 +1609,8 @@ export class ImmersiveMode {
       this.clearScaleDrags();
     }
 
-    // Leaving a two-handed pan: re-origin the remaining pinch so turntable doesn't hitch.
+    // Leaving a two-handed pan/scale: re-origin the remaining pinch so turntable doesn't hitch.
+    this.domainScaleGesture = null;
     for (const remaining of this.drags.values()) {
       if (remaining.kind === 'turntable') remaining.started = false;
     }
@@ -1638,18 +1697,32 @@ export class ImmersiveMode {
           if (!pose) continue;
 
           const { yaw, pitch } = aim(pose.transform.orientation, this.direction);
-          const { x, y, z } = pose.transform.position;
+          const rayPos = pose.transform.position;
+
+          // Pan from wrists: pulling both hands toward you must move the container toward you.
+          // Fall back to the target-ray origin when a source has no hand joints (controllers).
+          let x = rayPos.x;
+          let y = rayPos.y;
+          let z = rayPos.z;
+          if (panning) {
+            if (this.readWrist(drag.source, frame, referenceSpace, wristA)) {
+              x = wristA.x;
+              y = wristA.y;
+              z = wristA.z;
+            }
+          }
 
           if (drag.started) {
             if (panning) {
-              // Two hands: average travel pans the table in front of you.
               panDx += x - drag.x;
               panDy += y - drag.y;
               panDz += z - drag.z;
               panSamples++;
             } else if (this.turntableEnabled) {
-              const dYaw = -angleDelta(drag.yaw, yaw) * AIM_GAIN + (x - drag.x) * REACH_GAIN;
-              const dPitch = angleDelta(drag.pitch, pitch) * AIM_GAIN + (y - drag.y) * REACH_GAIN;
+              const dYaw =
+                -angleDelta(drag.yaw, yaw) * AIM_GAIN + (rayPos.x - drag.x) * REACH_GAIN;
+              const dPitch =
+                angleDelta(drag.pitch, pitch) * AIM_GAIN + (rayPos.y - drag.y) * REACH_GAIN;
 
               this.turn(dYaw, dPitch);
 
@@ -1657,6 +1730,10 @@ export class ImmersiveMode {
                 this.velocity.yaw = smoothSpin(this.velocity.yaw, dYaw / dt);
                 this.velocity.pitch = smoothSpin(this.velocity.pitch, dPitch / dt);
               }
+              // Single-hand turntable still tracks the ray origin in drag.x/y/z.
+              x = rayPos.x;
+              y = rayPos.y;
+              z = rayPos.z;
             }
           }
 
@@ -1673,6 +1750,9 @@ export class ImmersiveMode {
           this.applyPan(panDx * inv, panDy * inv, panDz * inv);
           this.velocity.yaw = 0;
           this.velocity.pitch = 0;
+          this.syncTwoHandDomainScale(frame, referenceSpace);
+        } else if (!panning) {
+          this.domainScaleGesture = null;
         }
       }
     }
