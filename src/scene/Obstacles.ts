@@ -165,12 +165,8 @@ export class Obstacles {
    * manipulated.
    */
   setGizmoEnabled(enabled: boolean): void {
-    if (enabled) {
-      if (this.selected !== null) this.gizmo.attach(this.items[this.selected].mesh);
-    } else {
-      this.gizmo.detach();
-    }
     this.gizmoEnabled = enabled;
+    this.syncGizmo();
   }
 
   /** The helper object that actually draws the gizmo; three keeps it separate from the controls. */
@@ -233,8 +229,20 @@ export class Obstacles {
       item.highlight.value = i === index ? 1 : 0;
     }
 
-    if (index === null || !this.gizmoEnabled) this.gizmo.detach();
-    else this.gizmo.attach(this.items[index].mesh);
+    this.syncGizmo();
+  }
+
+  /** Attach to the selection, or hide the helper so a detached gizmo does not sit at the origin. */
+  private syncGizmo(): void {
+    const mesh =
+      this.gizmoEnabled && this.selected !== null ? this.items[this.selected]?.mesh : undefined;
+    if (mesh) {
+      this.gizmo.attach(mesh);
+      this.gizmo.getHelper().visible = true;
+    } else {
+      this.gizmo.detach();
+      this.gizmo.getHelper().visible = false;
+    }
   }
 
   setMode(mode: GizmoMode): void {

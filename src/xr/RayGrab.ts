@@ -1,13 +1,11 @@
 /**
- * Holding an object on the end of a pointer ray.
+ * Holding a scene object during an XR pinch.
  *
- * All three modes work from the same two signals — where the ray points and where its origin has
- * moved to — because that is all a transient pointer gives you. There are no thumbsticks, no
- * trigger axis and no second button, so the mode has to say what a drag means rather than the
- * input distinguishing it.
+ * Translate follows wrist travel (world delta), not the gaze ray tip — selection still uses the
+ * ray, but once latched the object rides the hand. A second pinch scales from the ratio of
+ * inter-hand distance to the distance when that second pinch began.
  *
- * Everything is computed in world space and converted back through the object's parent on the way
- * out, since the primitives hang off a rig that is both scaled and rotated.
+ * Rotate / single-hand reach-scale keep the older ray signals for the mode panel.
  */
 import { Matrix4, Object3D, Quaternion, Vector3 } from 'three/webgpu';
 import type { GizmoMode } from '../scene/Obstacles';
@@ -19,8 +17,8 @@ export interface PointerRay {
   orientation: Quaternion;
 }
 
-/** Hand travel along the ray, in metres, for one e-fold of scale. */
-const SCALE_GAIN = 2.4;
+/** Hand travel along the ray, in metres, for one e-fold of scale (single-hand reach mode). */
+const REACH_SCALE_GAIN = 2.4;
 const SCALE_RANGE = { min: 0.15, max: 4.0 };
 
 /** Keeps a grab from latching onto something unreachably far away. */
@@ -32,10 +30,18 @@ const parentQuaternion = new Quaternion();
 const parentInverse = new Matrix4();
 const scratch = new Vector3();
 const delta = new Quaternion();
+const wristDelta = new Vector3();
+
+type Interaction = 'wrist' | 'ray' | 'twoHand';
 
 export class RayGrab {
   private object: Object3D | null = null;
   private mode: GizmoMode = 'translate';
+  private interaction: Interaction = 'wrist';
+
+  private readonly lastWrist = new Vector3();
+  private readonly scaleStart = new Vector3();
+  private scaleStartDist = 0;
 
   private readonly start = {
     origin: new Vector3(),
@@ -55,19 +61,31 @@ export class RayGrab {
     return this.object;
   }
 
-  begin(object: Object3D, ray: PointerRay, mode: GizmoMode): void {
+  get twoHand(): boolean {
+    return this.interaction === 'twoHand';
+  }
+
+  begin(object: Object3D, ray: PointerRay, mode: GizmoMode, wrist: Vector3 | null): void {
     object.updateWorldMatrix(true, false);
     object.getWorldPosition(worldPosition);
 
-    // The object is carried at the depth it was picked at rather than pulled to the hand, so a
-    // pinch never yanks it across the domain before the drag has even started.
+    this.object = object;
+    this.mode = mode;
+    object.getWorldQuaternion(this.start.quaternion);
+    this.start.scale.copy(object.scale);
+
+    if (mode === 'translate' && wrist) {
+      this.interaction = 'wrist';
+      this.lastWrist.copy(wrist);
+      return;
+    }
+
+    this.interaction = 'ray';
     const distance = Math.min(
       Math.max(scratch.subVectors(worldPosition, ray.origin).dot(ray.direction), 0),
       MAX_REACH,
     );
 
-    this.object = object;
-    this.mode = mode;
     this.start.origin.copy(ray.origin);
     this.start.direction.copy(ray.direction);
     this.start.orientation.copy(ray.orientation);
@@ -75,13 +93,51 @@ export class RayGrab {
     this.start.offset
       .copy(worldPosition)
       .sub(scratch.copy(ray.direction).multiplyScalar(distance).add(ray.origin));
-    object.getWorldQuaternion(this.start.quaternion);
-    this.start.scale.copy(object.scale);
+  }
+
+  /** Re-anchor wrist tracking after a second hand leaves, so the object does not jump. */
+  resumeWrist(wrist: Vector3): void {
+    if (!this.object || this.mode !== 'translate') return;
+    this.interaction = 'wrist';
+    this.lastWrist.copy(wrist);
+  }
+
+  moveWrist(wrist: Vector3): void {
+    const object = this.object;
+    if (!object?.parent || this.interaction !== 'wrist') return;
+
+    wristDelta.subVectors(wrist, this.lastWrist);
+    this.lastWrist.copy(wrist);
+    if (wristDelta.lengthSq() === 0) return;
+
+    object.updateWorldMatrix(true, false);
+    object.getWorldPosition(worldPosition).add(wristDelta);
+
+    parentInverse.copy(object.parent.matrixWorld).invert();
+    object.position.copy(worldPosition.applyMatrix4(parentInverse));
+  }
+
+  beginTwoHandScale(distance: number): void {
+    if (!this.object) return;
+    this.interaction = 'twoHand';
+    this.scaleStartDist = Math.max(distance, 1e-4);
+    this.scaleStart.copy(this.object.scale);
+  }
+
+  moveTwoHandScale(distance: number): void {
+    const object = this.object;
+    if (!object || this.interaction !== 'twoHand') return;
+
+    const factor = Math.min(
+      Math.max(distance / this.scaleStartDist, SCALE_RANGE.min),
+      SCALE_RANGE.max,
+    );
+    object.scale.copy(this.scaleStart).multiplyScalar(factor);
   }
 
   move(ray: PointerRay): void {
     const object = this.object;
-    if (!object?.parent) return;
+    if (!object?.parent || this.interaction !== 'ray') return;
 
     switch (this.mode) {
       case 'translate': {
@@ -106,12 +162,9 @@ export class RayGrab {
       }
 
       case 'scale': {
-        // Reach, not aim: pushing the hand away along the ray it started on grows the primitive.
-        // Using the ray's current direction instead would couple size to where you are pointing,
-        // and the object would swell every time you glanced off to one side.
         const push = scratch.subVectors(ray.origin, this.start.origin).dot(this.start.direction);
         const factor = Math.min(
-          Math.max(Math.exp(push * SCALE_GAIN), SCALE_RANGE.min),
+          Math.max(Math.exp(push * REACH_SCALE_GAIN), SCALE_RANGE.min),
           SCALE_RANGE.max,
         );
         object.scale.copy(this.start.scale).multiplyScalar(factor);
@@ -122,5 +175,6 @@ export class RayGrab {
 
   end(): void {
     this.object = null;
+    this.interaction = 'wrist';
   }
 }

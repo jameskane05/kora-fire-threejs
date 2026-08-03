@@ -1,0 +1,12 @@
+---
+description: Never run unbounded project tsc — it OOMs this machine
+alwaysApply: true
+---
+
+# No full-project `tsc`
+
+Do **not** run `tsc`, `npx tsc`, or `npm run typecheck` in this repo unless the user explicitly asks.
+
+TypeScript 7 native (`@typescript/typescript-darwin-arm64`) plus `three/webgpu` has been measured at **~1.4GB RSS** and multi-minute hangs, forcing Cursor/OS memory pressure.
+
+For type errors: use IDE diagnostics (`ReadLints`) on edited files only. Never spawn a whole-program check "to be safe."

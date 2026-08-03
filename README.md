@@ -134,14 +134,25 @@ The tiers move grid resolution and Jacobi iterations first because that is where
 
 ## Immersive VR
 
-There's an **Enter VR** button on headsets that can run it.
+There's an **Enter VR** button on headsets that can run it. On Apple Vision Pro (visionOS developer beta with the WebXR/WebGPU binding) the fire runs in the `performance` tier after the three.js pins below.
 
-**It does not currently work on visionOS.** The session opens, renders two frames, and then stops being asked for more, with no error and no `end` event. Frame cost, submission validity and the tone-mapping path have all been ruled out, and seven separate WebKit and three.js bugs were found and worked around before getting this far; none of them was the cause, and the cause is still open. The measurements are in [docs/visionos-webgpu-webxr.md](docs/visionos-webgpu-webxr.md). Everything below is implemented and works on desktop.
+### Materials lab
 
-The requirement worth calling out is that the session has to be WebGPU-backed. The solver *is* compute shaders, so there is no WebGL path to fall back to, and until WebKit shipped the WebXR/WebGPU binding this could not have worked on the device at all. Two things follow, both easy to get wrong:
+[`materials.html`](materials.html) is a second exhibit on the same WebXR stack: 3D **MLS-MPM** (sand / goo / water) with mouse and hand force fields. Classical continuum solver first (Hu et al. MLS-MPM; Klár-style sand; neo-Hookean goo; weakly compressible water) — neural hybrid / subspace / SSFR water table are follow-ons, not blockers.
 
-- `renderer.xr.enabled` has to be set **before** `renderer.init()`, because that is when three requests the adapter and passes the flag through as `xrCompatible`. Set it afterwards and the device is already the wrong kind.
-- the session is requested with `webgpu` as a *required* feature, alongside `layers`, which three needs in order to install its `XRGPUBinding` projection layer.
+### Vision Pro + three.js WebGPU XR
+
+Getting a `WebGPURenderer` immersive session upright on visionOS currently takes more than stock npm three. What this repo does:
+
+1. **Platform** — visionOS with `XRGPUBinding` / the `webgpu` session feature (Safari in the headset). Serve over HTTPS on the LAN; accept the self-signed cert once before Enter VR will work.
+2. **three.js pin** — npm `three@0.185.1` still disables WebGPU XR MSAA and always blit-resolves through an intermediate target. This project pins three to the [#34120](https://github.com/mrdoob/three.js/pull/34120) merge (WebGPU XR MSAA) and, in `postinstall` via [`scripts/build-three.mjs`](scripts/build-three.mjs), applies open [#34153](https://github.com/mrdoob/three.js/pull/34153) (single-pass output into the projection layer) then rebuilds `build/`. Without single-pass, visionOS tends to apply foveation to the blit rather than the scene and the stereo image warps badly toward the centre.
+3. **Session setup**
+   - set `renderer.xr.enabled = true` **before** `renderer.init()` (`xrCompatible` is requested then)
+   - `navigator.xr.requestSession('immersive-vr', { requiredFeatures: ['webgpu'], … })`
+   - after `setSession`, call `renderer.xr.setFoveation(0)` — three defaults to `1`, and Ada/Rik noted foveation can be applied twice; on visionOS that reads as heavy centre warp
+4. **Budget** — stereo volume raymarching at headset resolution is the limiter. This app steps quality down to `performance`, caps raymarch steps, warms up with cheap frames before enabling the solver, skips sparks/bloom in-session, and advances the sim every other frame. `/cube.html` is a bare WebGPU XR smoke test if you need to separate three/WebKit from the fire.
+
+Earlier visionOS plumbing notes (layer size `0×0`, viewport vs attachment mismatch, etc.) live in [docs/visionos-webgpu-webxr.md](docs/visionos-webgpu-webxr.md).
 
 The button stays hidden where immersive VR isn't offered at all, but says so explicitly on a browser that has WebXR without the WebGPU binding — that's the difference between an out-of-date visionOS and a bug, and it is not otherwise visible from inside a headset.
 

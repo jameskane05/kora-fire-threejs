@@ -68,8 +68,12 @@ export function combustionPass(ctx: Ctx): N {
     // oxygen to burn the soot straight back off, so almost none survived to become smoke.
     const pyrolysing = step(u.ignitionTemperature, temperature);
     const excessFuel = max(fuel.sub(oxygen.div(u.stoichO2)), float(0.0));
+    // The hot emitter is restamped at atmospheric density every frame and then expanded by
+    // ~T_atm/T, so a paper-literal first-order rate loses almost all new soot to dilution before
+    // it can leave the source. The artist-facing rate is therefore applied with enough gain that
+    // the useful 0–10 knob range actually builds a plume; without it, even "10" stays invisible.
     const nucleated = excessFuel
-      .mul(oneMinus(exp(u.sootFormationRate.negate().mul(u.dt))))
+      .mul(oneMinus(exp(u.sootFormationRate.negate().mul(u.dt).mul(float(10.0)))))
       .mul(pyrolysing);
     fuel.subAssign(nucleated);
     soot.addAssign(nucleated);
@@ -78,8 +82,13 @@ export function combustionPass(ctx: Ctx): N {
     // "In high-temperature, oxygen-rich regions—typically near flame cores—soot particles can
     //  be consumed through oxidation, converting them into gaseous combustion products."
     // Soot inherits the chemistry of the fuel it came from, so it burns by the same eq. (21).
+    //
+    // Only oxygen left after the fuel's stoichiometric claim counts as "oxygen-rich". Fuel
+    // combustion is gated on the flame front, so a rich pyrolysing core still holds its premixed
+    // O2; spending that O2 on soot would burn the smoke in the one place the paper says it forms.
     const hot = step(u.sootOxidationTemperature, temperature);
-    const sootLimit = min(soot, oxygen.div(u.stoichO2));
+    const excessOxygen = max(oxygen.sub(fuel.mul(u.stoichO2)), float(0.0));
+    const sootLimit = min(soot, excessOxygen.div(u.stoichO2));
     const oxidised = sootLimit
       .mul(oneMinus(exp(u.sootOxidationRate.negate().mul(u.dt))))
       .mul(hot)

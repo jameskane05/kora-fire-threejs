@@ -5,14 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "node scripts/typecheck.mjs",
+    "build:three": "node scripts/build-three.mjs",
+    "postinstall": "npm run build:three",
     "deploy": "vite build && cd dist && touch .nojekyll && git init -q && git add -A && git commit -qm 'Publish' && git push -qf git@github.com:jameskane05/kora-fire-threejs.git HEAD:gh-pages"
   },
   "dependencies": {
     "lil-gui": "^0.21.0",
-    "three": "^0.185.1"
+    "three": "git+https://github.com/mrdoob/three.js.git#d6521c46d5a8978c75a997a3748c1861d55c5b71"
   },
   "devDependencies": {
     "@types/three": "^0.185.1",

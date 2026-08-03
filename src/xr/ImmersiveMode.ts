@@ -14,20 +14,38 @@
  *  - the frame loop must go through `renderer.setAnimationLoop`, since in a session frames are
  *    driven by `XRSession.requestAnimationFrame` and not by the window's.
  *
- * Navigation is deliberately object-centric rather than viewer-centric: the rig stays put and
- * the simulation turns in front of you. Moving the viewer instead would be both more work and,
- * on a device with no thumbsticks, a good way to make someone ill.
+ * Navigation is deliberately object-centric rather than viewer-centric: one pinch turns the
+ * domain in front of you; two pinches pan it on the table. Moving the viewer instead would be
+ * both more work and, on a device with no thumbsticks, a good way to make someone ill.
  */
-import { Group, Object3D, Quaternion, Raycaster, Vector3, type Renderer } from 'three/webgpu';
+import {
+  Group,
+  type Matrix4,
+  Object3D,
+  Quaternion,
+  Raycaster,
+  Vector3,
+  type Renderer,
+} from 'three/webgpu';
 import { RayGrab, type PointerRay } from './RayGrab';
 import { ModePanel } from './ModePanel';
 import type { GizmoMode } from '../scene/Obstacles';
 
 /** Where the domain is placed relative to the viewer, in metres. */
-const PLACEMENT = { distance: 1.75, height: 1.25 };
+const DEFAULT_PLACEMENT = { distance: 1.15, height: 1.25 };
 
 /** The domain's largest dimension is scaled to this, so every preset frames the same way. */
-const FRAMED_SIZE = 0.9;
+const DEFAULT_FRAMED_SIZE = 0.9;
+
+/** Two-handed pinch pans the rig; gain on average hand travel in metres. */
+const PAN_GAIN = 1.35;
+const PAN_LIMIT = { x: 0.7, y: 0.45, z: 0.55 };
+
+/**
+ * When the session is head-origin (`local`) rather than floor-origin, floor-relative heights are
+ * shifted down by about a standing eye height so a “table at 0.9 m” still lands near the lap.
+ */
+const LOCAL_EYE_HEIGHT = 1.5;
 
 /**
  * Two gains, because a pinch is read from two signals at once.
@@ -58,23 +76,33 @@ const MAX_SPIN = 6.0;
 /** How far the box may be tipped, so it can never end up upside down. */
 const PITCH_LIMIT = Math.PI * 0.35;
 
+/**
+ * Two short pinches within this window cycle gizmo mode (move → turn → size).
+ * Measured between completed taps (`select` / `selectend`), not selectstart — transient-pointer
+ * sources often do not survive long enough for a selectstart-based arm to stick.
+ */
+const DOUBLE_PINCH_MS = 700;
+/** Longer than this is a hold/drag, not a tap, and does not arm a double-pinch. */
+const TAP_MAX_MS = 450;
+
+const GIZMO_MODE_ORDER: GizmoMode[] = ['translate', 'rotate', 'scale'];
+
 /** Frame counts that report in, so a loop that stalls shows up as a line that never arrives. */
 const FRAME_REPORTS = new Set([1, 2, 3, 5, 10, 30, 120]);
 
 /**
- * Shrinks the XR projection layer, which three's WebGPU path otherwise leaves at full size.
+ * Resizes the XR projection layer, which three's WebGPU path otherwise leaves to the compositor.
  *
  * On the WebGL path three passes its framebuffer scale factor into `createProjectionLayer`; the
  * WebGPU path passes only the formats, so the layer comes back at whatever the compositor
  * recommends. On a Vision Pro that is 4851x3887 per eye — around 38 megapixels of raymarching a
- * frame, backed by an eye buffer and a half-gigabyte float intermediate for tone mapping. The
- * session stays open and keeps handing out poses, but nothing is ever finished and presented, so
- * the passthrough environment simply never goes away.
+ * frame, backed by an eye buffer and a half-gigabyte float intermediate for tone mapping.
  *
- * A layer cannot be resized once built and three exposes no hook, so the scale is folded into the
- * call on its way through. `setFramebufferScaleFactor` is the equivalent knob on the WebGL path.
+ * visionOS ignores it in both directions: 0.3, 1 and 2.484 all return the same 2048x1984 layer.
+ * See {@link ImmersiveMode.cropFrusta} for what that costs and what is done about it.
  */
 let layerScale = 1;
+
 
 /**
  * Stops three setting a viewport or scissor rect for the duration of a session.
@@ -84,13 +112,54 @@ let layerScale = 1;
  * the same way. That is WebKit bug 315274, and it renders the scene into a sub-rectangle of each
  * eye. PlayCanvas hit it too and fixed it by simply not making the calls.
  *
- * A render pass defaults to the full attachment, which is what the compositor wants, and since
- * each eye is its own array layer there is no sub-rectangle to select in the first place. three
- * additionally scales the viewport by the renderer's pixel ratio, which on the WebGPU path is
- * never reset to 1 the way it is for WebGL — so at any tier above `performance` the viewport
+ * three additionally scales the viewport by the renderer's pixel ratio, which on the WebGPU path
+ * is never reset to 1 the way it is for WebGL — so at any tier above `performance` the viewport
  * came out larger than the attachment as well.
+ *
+ * Dropping the calls is only right if the compositor samples the whole attachment. It does not:
+ * the eye texture is padded, and the frustum belongs in a sub-rectangle of it. See
+ * {@link ViewportPolicy}.
  */
 let suppressPassRects = false;
+
+/**
+ * Where in the eye attachment a frustum is drawn.
+ *
+ * The compositor samples the rectangle it named and stretches that over the eye, so the only thing
+ * that has to be true is that the pixels land where it will look for them.
+ *
+ *  - `raw` — `setViewport(v.x, v.y, v.width, v.height)`, untouched. What three's own WebGPU path
+ *    does, and correct anywhere the two ends agree on which corner y is measured from.
+ *  - `full` — ignore the viewport, render across the whole attachment, and drop the rect calls
+ *    entirely. WebKit bug 315274's workaround, and correct only if the attachment is the eye.
+ *  - `fit` — scale the reported viewport uniformly until it fits the attachment. A safety net now
+ *    that `fitViewportToTexture` asks for a rectangle that already fits; on its own it is `raw`.
+ *  - `fit-flipped` — the same rectangle measured from the opposite edge. three hands the viewport
+ *    to `setViewport` untouched, but WebXR inherited bottom-left viewports from GL and WebGPU
+ *    takes them top-left, so a rectangle shorter than the attachment lands on the wrong side.
+ *
+ * Switchable during a session — the suppression shim reads it per call — so all four can be told
+ * apart by looking rather than by four re-entries.
+ */
+export type ViewportPolicy = 'raw' | 'full' | 'fit' | 'fit-flipped';
+
+/**
+ * three's XRManager.foveateBoundTexture assumes a post-processing target. With PR #34153's
+ * single-pass path that target is null, and an unpatched (or Vite-cached) build throws every
+ * frame. Guard it on the live instance so a stale prebundle cannot take the session down.
+ */
+function installFoveationNullGuard(xr: {
+  foveateBoundTexture?: (renderTarget: unknown) => void;
+  koraFoveationGuarded?: boolean;
+}): void {
+  if (xr.koraFoveationGuarded || typeof xr.foveateBoundTexture !== 'function') return;
+  const original = xr.foveateBoundTexture.bind(xr);
+  xr.foveateBoundTexture = (renderTarget: unknown) => {
+    if (renderTarget == null) return;
+    original(renderTarget);
+  };
+  xr.koraFoveationGuarded = true;
+}
 
 function installPassRectSuppression(): void {
   type Encoder = { prototype: Record<string, unknown> };
@@ -128,6 +197,18 @@ export interface ImmersiveCallbacks {
 }
 
 /**
+ * Extra world-space HUD (materials strip, etc.). Picked before turntable / grab.
+ * Return true from handlePick when the pinch was consumed by a button.
+ */
+export interface ActionPanel {
+  readonly group: Group;
+  readonly targets: Object3D[];
+  get visible(): boolean;
+  setVisible(visible: boolean): void;
+  handlePick(object: Object3D): boolean;
+}
+
+/**
  * The objects a pinch is allowed to pick up, and what to do once it has.
  *
  * Kept as an interface so the XR code does not need to know what a displacement volume is; it
@@ -144,10 +225,10 @@ export interface Manipulator {
 }
 
 /**
- * A pinch either turns the whole domain or moves one thing inside it, decided once at the moment
- * the pinch begins and fixed for its duration.
+ * A pinch either turns the whole domain, moves one thing inside it, or (as a second hand while
+ * something is held) drives two-hand scale. Kind is decided once when the pinch begins.
  */
-type DragKind = 'turntable' | 'object';
+type DragKind = 'turntable' | 'object' | 'scale';
 
 interface Drag {
   source: XRInputSource;
@@ -158,9 +239,27 @@ interface Drag {
   pitch: number;
   x: number;
   y: number;
+  z: number;
+}
+
+export interface PlacementOptions {
+  /** Metres in front of the viewer (along −Z). */
+  distance?: number;
+  /** Metres above the floor reference (local-floor). */
+  height?: number;
+  /** World size the domain is scaled to fit, in metres. */
+  framedSize?: number;
+  /**
+   * One-pinch turntable. Default on (fire). Materials leaves it off so a pinch is free for
+   * stirring; two pinches still pan.
+   */
+  turntable?: boolean;
 }
 
 const scratchQuaternion = new Quaternion();
+const wristA = new Vector3();
+const wristB = new Vector3();
+const wristScratch = new Vector3();
 
 /**
  * Where a pointer aims, as yaw and pitch in the reference space.
@@ -204,10 +303,18 @@ export class ImmersiveMode {
   /**
    * Dumps each eye's sub-image on the second frame of the next session.
    *
-   * Off by default: it calls into the binding on the same frame as the first render, which is a
-   * poor thing to have in the picture when that frame is the one under suspicion.
+   * It calls into the binding on the same frame as the first render, which was a poor thing to
+   * have in the picture while the first frame was the one under suspicion. Now that a session
+   * survives, the sub-image layout is the only place the eye geometry is stated outright.
    */
-  debugViews = false;
+  debugViews = true;
+
+  /**
+   * See {@link ViewportPolicy}. `full` because {@link cropFrusta} makes the frustum follow the
+   * rectangle drawn rather than the other way round, and the whole attachment is the largest
+   * rectangle available — so it buys the widest window the layer can reach.
+   */
+  viewportPolicy: ViewportPolicy = 'full';
 
   private readonly drags = new Map<XRInputSource, Drag>();
   private readonly velocity = { yaw: 0, pitch: 0 };
@@ -220,16 +327,55 @@ export class ImmersiveMode {
     orientation: new Quaternion(),
   };
   private panel: ModePanel | null = null;
+  private actionPanel: ActionPanel | null = null;
   private manipulator: Manipulator | null = null;
+  /** Sandbox folds gizmo mode into its paginated HUD; the legacy strip stays off there. */
+  private modePanelEnabled = true;
   private domainSize = 1;
+  private placement = { ...DEFAULT_PLACEMENT };
+  private framedSize = DEFAULT_FRAMED_SIZE;
+  private turntableEnabled = true;
+  /** Floor-relative placement is valid (local-floor); otherwise heights are eye-relative. */
+  private usesFloorOrigin = true;
+  /** True until the first viewer pose places the stage in front of the user. */
+  private pendingAnchor = false;
+  /** Rig position before pan — set from the viewer so the stage is not left behind you. */
+  private readonly anchorBase = new Vector3(
+    0,
+    DEFAULT_PLACEMENT.height,
+    -DEFAULT_PLACEMENT.distance,
+  );
+  private readonly anchorForward = new Vector3(0, 0, -1);
+  /** Extra translation from two-handed pan, in metres (reference space). */
+  private readonly panOffset = new Vector3();
   private button: HTMLButtonElement | null = null;
   private session: XRSession | null = null;
   private presenting = false;
   private framesSeen = 0;
   private sessionStart = 0;
-  private layerScale = 0.5;
+  private layerScale = 1;
+  private viewportScale = 1;
   private targetReady = false;
   private pixelRatioBeforeXR = 1;
+  /** The viewport as the compositor reported it, before it was fitted to the attachment. */
+  private rawViewport = 'none';
+  /** The sub-image viewport as first quoted, which is what the crop is a fraction of. */
+  private baseViewport: { width: number; height: number } | null = null;
+  /**
+   * See {@link cropFrusta}. Off by default — it broke stereo convergence. Kept as a toggle while
+   * the visionOS layer/viewport mismatch is still being sorted out.
+   */
+  frustumCrop = false;
+  private reportedCrop = false;
+  /** Set by a policy change, so the effect of one shows up in the log without re-entering. */
+  private reportNext = false;
+  private warnedOversize = false;
+  private warnedNoScale = false;
+  /** `performance.now()` of the last short tap that armed a double-pinch. */
+  private lastTapEnd = 0;
+  private readonly pinchBeganAt = new WeakMap<XRInputSource, number>();
+  /** Dedupes `select` + `selectend` both noting the same gesture. */
+  private readonly pinchTapNoted = new WeakMap<XRInputSource, boolean>();
 
   constructor(
     private readonly renderer: Renderer,
@@ -240,10 +386,11 @@ export class ImmersiveMode {
     this.rig.visible = true;
 
     this.onSelectStart = this.onSelectStart.bind(this);
+    this.onSelect = this.onSelect.bind(this);
     this.onSelectEnd = this.onSelectEnd.bind(this);
   }
 
-  /** Supplies what a pinch may pick up. The mode panel appears once one is set. */
+  /** Supplies what a pinch may pick up. The mode panel appears once one is set (if enabled). */
   setManipulator(manipulator: Manipulator): void {
     this.manipulator = manipulator;
 
@@ -252,6 +399,24 @@ export class ImmersiveMode {
       this.hud.add(this.panel.group);
     }
     this.panel.setMode(manipulator.mode);
+    this.panel.setVisible(this.modePanelEnabled && this.session !== null);
+  }
+
+  /** Hide the legacy move/turn/size strip when a sandbox HUD owns that affordance. */
+  setModePanelEnabled(enabled: boolean): void {
+    this.modePanelEnabled = enabled;
+    this.panel?.setVisible(enabled && this.session !== null);
+  }
+
+  /**
+   * World-space action strip (e.g. materials sand/goo/water). Shown for the session and
+   * hit-tested on selectstart ahead of turntable / object grabs.
+   */
+  setActionPanel(panel: ActionPanel): void {
+    if (this.actionPanel) this.hud.remove(this.actionPanel.group);
+    this.actionPanel = panel;
+    this.hud.add(panel.group);
+    panel.setVisible(this.session !== null);
   }
 
   /** Reflects a mode change that came from somewhere else, so the button strip agrees. */
@@ -269,11 +434,41 @@ export class ImmersiveMode {
   }
 
   /**
-   * Fraction of the compositor's recommended eye resolution to render at. Takes effect on the
-   * next session, since a projection layer is fixed in size once it exists.
+   * Resizes the projection layer itself. Takes effect on the next session, since a layer is fixed
+   * in size once it exists — which is why it is also remembered across one.
+   *
+   * Below 1 this is a plain resolution control: the image still covers the eye, with fewer pixels
+   * behind it. Above 1 it would ask for more, which visionOS declines — 2.484 returned the same
+   * 2048x1984 layer as 1 did — so on that platform this is inert in both directions.
    */
-  setLayerScale(scale: number): void {
-    this.layerScale = Math.max(0.1, Math.min(1, scale));
+  setLayerScale(scale: number): number {
+    this.layerScale = Math.max(0.1, Math.min(6, scale));
+    return this.layerScale;
+  }
+
+  /**
+   * Fraction of each eye the compositor is asked to hand back for drawing.
+   *
+   * The sanctioned way to trade resolution for frame time: the texture keeps its size, the runtime
+   * returns a smaller sub-image within it, and the compositor stretches what it finds there back
+   * over the eye. On visionOS the second half of that does not happen — the presented region does
+   * not follow the request — so it cuts the drawn rectangle without cutting the displayed one, and
+   * is left at 1. `setLayerScale` is the knob with an effect on this platform.
+   *
+   * Applies from the frame after it is asked, which is why it is re-asked every frame.
+   */
+  setViewportScale(scale: number): number {
+    this.viewportScale = Math.max(0.1, Math.min(1, scale));
+    this.reportNext = true;
+    return this.viewportScale;
+  }
+
+  /** Takes effect on the next frame, so the four can be compared inside one session. */
+  setViewportPolicy(policy: ViewportPolicy): ViewportPolicy {
+    this.viewportPolicy = policy;
+    if (this.session) suppressPassRects = policy === 'full';
+    this.reportNext = true;
+    return policy;
   }
 
   /** The layer's per-eye texture, read off three's handle, to confirm the scale actually took. */
@@ -374,13 +569,14 @@ export class ImmersiveMode {
   }
 
   /**
-   * Keeps each eye's viewport inside the texture it is drawn into.
+   * Applies {@link ViewportPolicy} to the viewport three took from each sub-image.
    *
-   * visionOS reports a sub-image viewport of the recommended resolution while handing back a much
-   * smaller texture, and three copies that viewport onto the sub-cameras verbatim. Setting a
-   * viewport larger than its attachment is a validation error, so the frame is thrown away.
+   * Under `raw` this only reads the rectangle, which is the point: a viewport that has to be
+   * repaired before it can be used is evidence about the layer, not a problem to be solved here.
+   * The one thing worth saying out loud is a viewport larger than the attachment, since that is a
+   * validation error rather than a wrong picture and the frame is simply thrown away.
    */
-  private clampViewports(): void {
+  private fitViewports(): void {
     const target = (
       this.renderer.xr as unknown as { _xrRenderTarget?: { width: number; height: number } }
     )._xrRenderTarget;
@@ -390,13 +586,127 @@ export class ImmersiveMode {
       cameras?: { viewport?: { x: number; y: number; width: number; height: number } }[];
     };
 
+    const policy = this.viewportPolicy;
+
+    (xrCamera.cameras ?? []).forEach((sub, i) => {
+      const v = sub.viewport;
+      if (!v) return;
+      if (i === 0) {
+        this.rawViewport = `${v.x},${v.y} ${v.width}x${v.height}`;
+        // Before any policy touches it: the quoted rectangle is what the crop is a fraction of.
+        if (!this.baseViewport && v.width > 0) {
+          this.baseViewport = { width: v.width, height: v.height };
+        }
+      }
+
+      if (policy === 'raw') {
+        if (!this.warnedOversize && (v.x + v.width > target.width || v.y + v.height > target.height)) {
+          this.warnedOversize = true;
+          console.warn(
+            `[kora/xr] eye ${i}'s viewport ${v.x},${v.y} ${v.width}x${v.height} does not fit the ` +
+              `${target.width}x${target.height} attachment; every frame will fail validation. ` +
+              `Try kora.xrViewport('fit').`,
+          );
+        }
+        return;
+      }
+
+      if (policy === 'full') {
+        v.x = 0;
+        v.y = 0;
+        v.width = target.width;
+        v.height = target.height;
+        return;
+      }
+
+      const scale = Math.min(target.width / v.width, target.height / v.height, 1);
+      const width = Math.max(1, Math.floor(v.width * scale));
+      const height = Math.max(1, Math.floor(v.height * scale));
+      const x = Math.min(Math.max(0, Math.floor(v.x * scale)), target.width - width);
+      const y = Math.min(Math.max(0, Math.floor(v.y * scale)), target.height - height);
+
+      v.x = x;
+      v.y = policy === 'fit-flipped' ? target.height - height - y : y;
+      v.width = width;
+      v.height = height;
+    });
+  }
+
+  /**
+   * Narrows each eye's frustum to the part of it the layer can actually reach.
+   *
+   * visionOS quotes a 5087x4081 sub-image against a 2048x1984 layer and then samples the rectangle
+   * it quoted, so three fifths of what it reads is off the end of the texture. Drawing the whole
+   * frustum into the part that exists is what produced the original complaint: the scene rendered
+   * at 40% of its true angular size, pushed into the top-left of the eye, with the rest of the
+   * display filled by whatever lies past the edge of the texture — and anything moving outward
+   * leaving the painted region long before it left view.
+   *
+   * Nothing about where the frame is drawn can fix that, in any of the four ways
+   * {@link ViewportPolicy} allows, because the texels are not there to be drawn into.
+   * `requestViewportScale` cannot either: it changes the rectangle that is drawn without changing
+   * the one that is presented. Nor can the layer be asked for larger — 0.3, 1 and 2.484 all return
+   * 2048x1984 — so the size is not ours to choose.
+   *
+   * What is ours to choose is the lens. The texture covers a known fraction of the rectangle being
+   * sampled, that fraction maps to a known sub-frustum of the eye, and rendering that sub-frustum
+   * instead puts everything at the angular size it belongs at. The cost is the rest of the eye,
+   * which stays black: a correct view through a window rather than an incorrect one filling the
+   * display. It costs nothing where the two agree, since the fraction is then 1.
+   */
+  private cropFrusta(): void {
+    const quoted = this.baseViewport;
+    if (!this.frustumCrop || !quoted || quoted.width === 0) return;
+
+    const xrCamera = this.renderer.xr.getCamera() as unknown as {
+      cameras?: {
+        viewport?: { x: number; y: number; width: number; height: number };
+        projectionMatrix: Matrix4;
+        projectionMatrixInverse: Matrix4;
+      }[];
+    };
+
     for (const sub of xrCamera.cameras ?? []) {
       const v = sub.viewport;
-      if (!v) continue;
-      v.x = Math.max(0, Math.min(v.x, target.width));
-      v.y = Math.max(0, Math.min(v.y, target.height));
-      v.width = Math.min(v.width, target.width - v.x);
-      v.height = Math.min(v.height, target.height - v.y);
+      const e = sub.projectionMatrix.elements;
+      if (!v || e[0] === 0 || e[5] === 0) continue;
+
+      // Where the rectangle being drawn sits inside the rectangle being sampled. The compositor
+      // reads texel for texel from the top-left, so these are the same coordinates.
+      const u0 = v.x / quoted.width;
+      const u1 = (v.x + v.width) / quoted.width;
+      const w0 = v.y / quoted.height;
+      const w1 = (v.y + v.height) / quoted.height;
+      if (u0 <= 0.001 && u1 >= 0.999 && w0 <= 0.001 && w1 >= 0.999) continue;
+
+      // The frustum as tangents of its half-angles, which is the form the crop is a fraction of.
+      const left = (e[8] - 1) / e[0];
+      const right = (e[8] + 1) / e[0];
+      const bottom = (e[9] - 1) / e[5];
+      const top = (e[9] + 1) / e[5];
+
+      const l = left + (right - left) * u0;
+      const r = left + (right - left) * u1;
+      const t = top - (top - bottom) * w0;
+      const b = top - (top - bottom) * w1;
+
+      e[0] = 2 / (r - l);
+      e[8] = (r + l) / (r - l);
+      e[5] = 2 / (t - b);
+      e[9] = (t + b) / (t - b);
+
+      sub.projectionMatrixInverse.copy(sub.projectionMatrix).invert();
+
+      if (!this.reportedCrop) {
+        this.reportedCrop = true;
+        const deg = (tan: number) => ((Math.atan(tan) * 180) / Math.PI).toFixed(1);
+        this.log(
+          `cropping each eye to the ${((u1 - u0) * 100).toFixed(1)}% x ` +
+            `${((w1 - w0) * 100).toFixed(1)}% of its frustum the layer can reach — ` +
+            `L${deg(l)} R${deg(r)} D${deg(b)} U${deg(t)} — so it renders at true scale, ` +
+            'with the rest of the display left black',
+        );
+      }
     }
   }
 
@@ -419,12 +729,24 @@ export class ImmersiveMode {
    * is re-asked every frame rather than set once.
    */
   private requestViewportScale(frame: XRFrame, referenceSpace: XRReferenceSpace): void {
+    if (this.viewportScale >= 1) return;
+
     const pose = frame.getViewerPose(referenceSpace);
     if (!pose) return;
 
     for (const view of pose.views) {
       const scalable = view as unknown as { requestViewportScale?: (scale: number) => void };
-      scalable.requestViewportScale?.(this.layerScale);
+      if (!scalable.requestViewportScale) {
+        if (!this.warnedNoScale) {
+          this.warnedNoScale = true;
+          console.warn(
+            '[kora/xr] XRView.requestViewportScale is missing, so the sub-image cannot be brought ' +
+              'down to the size of the texture behind it and part of the eye will be edge clamp.',
+          );
+        }
+        return;
+      }
+      scalable.requestViewportScale(this.viewportScale);
     }
   }
 
@@ -472,18 +794,109 @@ export class ImmersiveMode {
     this.layout();
   }
 
+  /**
+   * Where the domain sits in XR and how large it frames. Materials uses a near tabletop;
+   * fire keeps the default mid-air placement.
+   */
+  setPlacement(options: PlacementOptions): void {
+    if (options.distance !== undefined) this.placement.distance = options.distance;
+    if (options.height !== undefined) this.placement.height = options.height;
+    if (options.framedSize !== undefined) this.framedSize = options.framedSize;
+    if (options.turntable !== undefined) {
+      this.turntableEnabled = options.turntable;
+      if (!this.turntableEnabled) {
+        this.velocity.yaw = 0;
+        this.velocity.pitch = 0;
+        this.pivot.rotation.set(0, 0, 0);
+      }
+    }
+    this.layout();
+  }
+
   private layout(): void {
     if (this.session) {
-      const scale = FRAMED_SIZE / Math.max(this.domainSize, 1e-3);
+      const scale = this.framedSize / Math.max(this.domainSize, 1e-3);
       this.rig.scale.setScalar(scale);
-      this.rig.position.set(0, PLACEMENT.height, -PLACEMENT.distance);
+      if (!this.pendingAnchor) this.applyRigPose();
+      else {
+        // Pre-anchor fallback: origin facing −Z (replaced on the first viewer pose).
+        this.anchorBase.set(
+          0,
+          this.usesFloorOrigin ? this.placement.height : this.placement.height - LOCAL_EYE_HEIGHT,
+          -this.placement.distance,
+        );
+        this.applyRigPose();
+      }
     } else {
       // Outside a session the desktop camera frames the domain itself, so the rig is a no-op
       // and only has to undo the pivot offset.
       this.rig.scale.setScalar(1);
       this.rig.position.set(0, this.domainSize / 2, 0);
       this.pivot.rotation.set(0, 0, 0);
+      this.panOffset.set(0, 0, 0);
+      this.hud.position.set(0, 0, 0);
+      this.hud.rotation.set(0, 0, 0);
+      this.anchorBase.set(0, this.placement.height, -this.placement.distance);
     }
+  }
+
+  private applyRigPose(): void {
+    this.rig.position.set(
+      this.anchorBase.x + this.panOffset.x,
+      this.anchorBase.y + this.panOffset.y,
+      this.anchorBase.z + this.panOffset.z,
+    );
+  }
+
+  private applyPan(dx: number, dy: number, dz: number): void {
+    this.panOffset.x = Math.max(-PAN_LIMIT.x, Math.min(PAN_LIMIT.x, this.panOffset.x + dx));
+    this.panOffset.y = Math.max(-PAN_LIMIT.y, Math.min(PAN_LIMIT.y, this.panOffset.y + dy));
+    this.panOffset.z = Math.max(-PAN_LIMIT.z, Math.min(PAN_LIMIT.z, this.panOffset.z + dz));
+    this.applyRigPose();
+  }
+
+  /**
+   * Puts the stage and HUD in front of wherever the user is actually looking when the session
+   * starts — fixed room placement was easy to “lose” if you entered facing the other way.
+   */
+  private anchorFromViewer(pose: XRViewerPose): void {
+    const p = pose.transform.position;
+    const o = pose.transform.orientation;
+    scratchQuaternion.set(o.x, o.y, o.z, o.w);
+    this.anchorForward.set(0, 0, -1).applyQuaternion(scratchQuaternion);
+    this.anchorForward.y = 0;
+    if (this.anchorForward.lengthSq() < 1e-8) this.anchorForward.set(0, 0, -1);
+    else this.anchorForward.normalize();
+
+    const y = this.usesFloorOrigin
+      ? this.placement.height
+      : p.y + (this.placement.height - LOCAL_EYE_HEIGHT);
+
+    this.anchorBase.set(
+      p.x + this.anchorForward.x * this.placement.distance,
+      y,
+      p.z + this.anchorForward.z * this.placement.distance,
+    );
+    this.panOffset.set(0, 0, 0);
+    this.applyRigPose();
+
+    // HUD stays in reference space, yawed to face the user; panels keep their local offsets.
+    const hudY = this.usesFloorOrigin ? 0 : p.y - LOCAL_EYE_HEIGHT;
+    this.hud.position.set(p.x, hudY, p.z);
+    this.hud.rotation.set(0, Math.atan2(-this.anchorForward.x, -this.anchorForward.z), 0);
+
+    this.log(
+      `anchored stage | floor=${this.usesFloorOrigin} | ` +
+        `base (${this.anchorBase.x.toFixed(2)}, ${this.anchorBase.y.toFixed(2)}, ${this.anchorBase.z.toFixed(2)})`,
+    );
+  }
+
+  private turntableCount(): number {
+    let n = 0;
+    for (const drag of this.drags.values()) {
+      if (drag.kind === 'turntable') n++;
+    }
+    return n;
   }
 
   /**
@@ -521,37 +934,125 @@ export class ImmersiveMode {
     button.addEventListener('click', () => void this.toggle());
   }
 
+  /**
+   * visionOS sometimes shows the immersive prompt, then stalls forever waiting for a hand-tracking
+   * dialog that never appears. A timed-out requestSession cannot be cancelled — stacking a second
+   * request in the same click is what left the button on “Starting…” forever. On stall we restore
+   * the button and skip hands on the *next* click instead.
+   */
+  private preferHandTracking = true;
+  private entering = false;
+
   private async toggle(): Promise<void> {
     if (this.session) {
       await this.session.end();
       return;
     }
 
-    if (!navigator.xr || !this.button) return;
+    if (!navigator.xr || !this.button || this.entering) return;
+    this.entering = true;
     this.button.disabled = true;
-    this.log('requesting a session');
+    this.button.textContent = 'Starting…';
+    this.log('requesting a session', { handTracking: this.preferHandTracking });
+
+    // Absolute backstop — even if something in begin() hangs past setSession's own timeout.
+    const watchdog = window.setTimeout(() => {
+      if (this.presenting || !this.button) return;
+      this.log('entry watchdog — restoring Enter VR');
+      this.preferHandTracking = false;
+      this.button.disabled = false;
+      this.button.textContent = 'Enter VR';
+      this.entering = false;
+    }, 12_000);
 
     try {
-      const session = await navigator.xr.requestSession('immersive-vr', {
-        requiredFeatures: ['webgpu'],
-        // three composites through an XRGPUBinding projection layer, which it installs with
-        // updateRenderState, so `layers` has to be asked for even though it looks incidental.
-        optionalFeatures: ['local-floor', 'bounded-floor', 'layers', 'hand-tracking'],
-      });
+      const session = await this.requestImmersiveSession();
       this.log('session granted', [...(session.enabledFeatures ?? [])]);
       await this.begin(session);
     } catch (error) {
       // Leaving `session` set here would strand the frame loop on its XR branch with no session
       // behind it, so the page carries on running but stops drawing what it used to.
+      const orphan = this.session;
       this.session = null;
       this.presenting = false;
       this.targetReady = false;
       suppressPassRects = false;
       this.renderer.setPixelRatio(this.pixelRatioBeforeXR);
-      this.button.disabled = false;
-      this.button.textContent = 'Enter VR';
+      if (orphan) {
+        try {
+          await orphan.end();
+        } catch {
+          /* already dead */
+        }
+      }
       console.error('[kora] could not start an immersive session:', error);
+    } finally {
+      window.clearTimeout(watchdog);
+      this.entering = false;
+      // begin() enables the button as Exit VR on success; recover Enter VR on any failure path.
+      if (this.button && !this.presenting) {
+        this.button.disabled = false;
+        this.button.textContent = 'Enter VR';
+      }
     }
+  }
+
+  private async requestImmersiveSession(): Promise<XRSession> {
+    // three composites through an XRGPUBinding projection layer, which it installs with
+    // updateRenderState, so `layers` has to be asked for even though it looks incidental.
+    const optional = ['local-floor', 'bounded-floor', 'layers'];
+    if (this.preferHandTracking) optional.push('hand-tracking');
+
+    try {
+      return await this.requestSessionWithTimeout(
+        {
+          requiredFeatures: ['webgpu'],
+          optionalFeatures: optional,
+        },
+        6_000,
+      );
+    } catch (error) {
+      // Do not requestSession again in this click — the timed-out call is still pending in the
+      // browser and a retry wedges on Starting… until reload.
+      if (this.preferHandTracking) {
+        this.preferHandTracking = false;
+        this.log(
+          'hand-tracking session stalled; click Enter VR again to join without hands',
+          error,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private requestSessionWithTimeout(init: XRSessionInit, ms: number): Promise<XRSession> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`requestSession timed out after ${ms}ms`));
+      }, ms);
+
+      void navigator.xr!.requestSession('immersive-vr', init).then(
+        (session) => {
+          if (settled) {
+            // Timed out already — drop the late grant so it cannot steal the page.
+            void session.end();
+            return;
+          }
+          settled = true;
+          window.clearTimeout(timer);
+          resolve(session);
+        },
+        (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
   }
 
   private async begin(session: XRSession): Promise<void> {
@@ -561,35 +1062,62 @@ export class ImmersiveMode {
 
     session.addEventListener('end', () => this.end());
     session.addEventListener('selectstart', this.onSelectStart);
+    session.addEventListener('select', this.onSelect);
     session.addEventListener('selectend', this.onSelectEnd);
 
-    this.renderer.xr.setReferenceSpaceType(
-      session.enabledFeatures?.includes('local-floor') ? 'local-floor' : 'local',
-    );
+    this.usesFloorOrigin = session.enabledFeatures?.includes('local-floor') ?? false;
+    this.renderer.xr.setReferenceSpaceType(this.usesFloorOrigin ? 'local-floor' : 'local');
 
     // onEnter picks the immersive quality tier, which is where the layer scale comes from, so the
     // shim has to go in after it and before three builds the layer inside setSession.
+    this.panOffset.set(0, 0, 0);
+    this.pendingAnchor = true;
+    this.velocity.yaw = 0;
+    this.velocity.pitch = 0;
+    this.pivot.rotation.set(0, 0, 0);
     this.callbacks.onEnter();
     this.layout();
-    this.panel?.setVisible(true);
+    this.panel?.setVisible(this.modePanelEnabled);
+    this.actionPanel?.setVisible(true);
 
     layerScale = this.layerScale;
-    const scaled = installLayerScale();
+    const scaled = this.layerScale !== 1 ? installLayerScale() : false;
 
     installPassRectSuppression();
-    suppressPassRects = true;
+    suppressPassRects = this.viewportPolicy === 'full';
 
     // What three's WebGL paths do inside setSession and its WebGPU path forgets. Nothing about a
     // projection layer is measured in CSS pixels, and three scales the eye viewport by this.
     this.pixelRatioBeforeXR = this.renderer.getPixelRatio();
     this.renderer.setPixelRatio(1);
 
-    await this.renderer.xr.setSession(session);
+    installFoveationNullGuard(
+      this.renderer.xr as {
+        foveateBoundTexture?: (renderTarget: unknown) => void;
+        koraFoveationGuarded?: boolean;
+      },
+    );
+
+    await Promise.race([
+      this.renderer.xr.setSession(session),
+      new Promise<never>((_, reject) => {
+        window.setTimeout(() => reject(new Error('setSession timed out after 8000ms')), 8000);
+      }),
+    ]);
+
+    // three defaults foveation to 1.0 and applies it on the projection layer *and* (WebGL) via
+    // foveateBoundTexture on the tone-map target — Ada's "applied twice". visionOS already
+    // foveates the compositor side; stacking max fixed foveation on top warps the periphery.
+    // Must run after setSession, which re-applies the default.
+    this.renderer.xr.setFoveation(0);
+
     this.presenting = true;
     this.sessionStart = performance.now();
     this.log(
-      `renderer bound | requested scale ${layerScale} | shim ${scaled ? 'installed' : 'FAILED'} | ` +
-        `layer ${this.layerSize()}`,
+      `renderer bound | layer scale ${layerScale} ${scaled ? '(shim installed)' : '(native)'} | ` +
+        `viewport scale ${this.viewportScale} | policy ${this.viewportPolicy} | ` +
+        `foveation ${this.renderer.xr.getFoveation()} | layer ${this.layerSize()} | ` +
+        `hands ${session.enabledFeatures?.includes('hand-tracking') ? 'on' : 'off'}`,
     );
 
     if (this.button) {
@@ -604,13 +1132,19 @@ export class ImmersiveMode {
     this.presenting = false;
     this.targetReady = false;
     suppressPassRects = false;
+    // Next session gets its own layer, so it has to be measured again.
+    this.baseViewport = null;
+    this.reportedCrop = false;
     this.renderer.setPixelRatio(this.pixelRatioBeforeXR);
     this.drags.clear();
     this.grab.end();
     this.velocity.yaw = 0;
     this.velocity.pitch = 0;
+    this.lastTapEnd = 0;
 
     this.panel?.setVisible(false);
+    this.actionPanel?.setVisible(false);
+    this.pendingAnchor = false;
     this.layout();
     this.callbacks.onExit();
 
@@ -640,6 +1174,113 @@ export class ImmersiveMode {
   }
 
   /**
+   * Wrist (or best stand-in) for a pinch source, in reference space.
+   *
+   * visionOS often exposes the pinch as a transient-pointer without `source.hand`, while the
+   * tracked skeleton lives on a separate hand source — so this also searches session hands and
+   * picks the wrist nearest the gaze ray.
+   */
+  private readWrist(
+    source: XRInputSource,
+    frame: XRFrame,
+    referenceSpace: XRReferenceSpace,
+    out: Vector3,
+  ): boolean {
+    if (this.readWristFromHand(source.hand, frame, referenceSpace, out)) return true;
+
+    if (source.gripSpace) {
+      const grip = frame.getPose(source.gripSpace, referenceSpace);
+      if (grip) {
+        const { x, y, z } = grip.transform.position;
+        out.set(x, y, z);
+        return true;
+      }
+    }
+
+    if (!this.readRay(source, frame, referenceSpace)) return false;
+
+    let best = Infinity;
+    let found = false;
+    for (const other of this.session?.inputSources ?? []) {
+      if (!other.hand) continue;
+      if (
+        source.handedness !== 'none' &&
+        other.handedness !== 'none' &&
+        other.handedness !== source.handedness
+      ) {
+        continue;
+      }
+      if (!this.readWristFromHand(other.hand, frame, referenceSpace, wristScratch)) continue;
+
+      const ox = wristScratch.x - this.ray.origin.x;
+      const oy = wristScratch.y - this.ray.origin.y;
+      const oz = wristScratch.z - this.ray.origin.z;
+      const along =
+        ox * this.ray.direction.x + oy * this.ray.direction.y + oz * this.ray.direction.z;
+      const dx = ox - this.ray.direction.x * along;
+      const dy = oy - this.ray.direction.y * along;
+      const dz = oz - this.ray.direction.z * along;
+      const lateral = dx * dx + dy * dy + dz * dz;
+      if (lateral < best) {
+        best = lateral;
+        out.copy(wristScratch);
+        found = true;
+      }
+    }
+    if (found) return true;
+
+    out.copy(this.ray.origin);
+    return true;
+  }
+
+  private readWristFromHand(
+    hand: XRHand | null | undefined,
+    frame: XRFrame,
+    referenceSpace: XRReferenceSpace,
+    out: Vector3,
+  ): boolean {
+    const joint = hand?.get('wrist');
+    if (!joint) return false;
+    const pose =
+      frame.getJointPose?.(joint, referenceSpace) ?? frame.getPose(joint, referenceSpace);
+    if (!pose) return false;
+    const { x, y, z } = pose.transform.position;
+    out.set(x, y, z);
+    return true;
+  }
+
+  private findDrag(kind: DragKind): Drag | undefined {
+    for (const drag of this.drags.values()) {
+      if (drag.kind === kind) return drag;
+    }
+    return undefined;
+  }
+
+  private clearScaleDrags(): void {
+    for (const [source, drag] of this.drags) {
+      if (drag.kind === 'scale') this.drags.delete(source);
+    }
+  }
+
+  private syncTwoHandScale(frame: XRFrame, referenceSpace: XRReferenceSpace): boolean {
+    const objectDrag = this.findDrag('object');
+    const scaleDrag = this.findDrag('scale');
+    if (!objectDrag || !scaleDrag) return false;
+
+    if (
+      !this.readWrist(objectDrag.source, frame, referenceSpace, wristA) ||
+      !this.readWrist(scaleDrag.source, frame, referenceSpace, wristB)
+    ) {
+      return true;
+    }
+
+    const distance = wristA.distanceTo(wristB);
+    if (!this.grab.twoHand) this.grab.beginTwoHandScale(distance);
+    else this.grab.moveTwoHandScale(distance);
+    return true;
+  }
+
+  /**
    * How the session is getting on, at a few frame counts.
    *
    * The mean frame time is the useful number here: a headset that shows nothing because the frame
@@ -661,6 +1302,38 @@ export class ImmersiveMode {
     const projAspect = p && p[0] !== 0 ? (p[5] / p[0]).toFixed(3) : '?';
     const eyeAspect = eye && eye.height !== 0 ? (eye.width / eye.height).toFixed(3) : '?';
 
+    // Each eye's frustum as the four half-angles it actually subtends. An aspect ratio cannot tell
+    // a plausible eye from an implausible one, and this is the difference between "drawn into the
+    // wrong rectangle" — a linear squash — and "drawn with the wrong lens", which is what a
+    // stretched periphery over a receding centre means. A Vision Pro eye is a little over 50
+    // degrees each way; anything near 90 is a union of both eyes or a frustum built by mistake.
+    const frusta = (pose?.views ?? [])
+      .map((view, i) => {
+        const m = view.projectionMatrix;
+        if (!m || m[0] === 0 || m[5] === 0) return `view ${i} ?`;
+        const deg = (tan: number) => (Math.atan(tan) * 180) / Math.PI;
+        const left = deg((m[8] - 1) / m[0]);
+        const right = deg((m[8] + 1) / m[0]);
+        const down = deg((m[9] - 1) / m[5]);
+        const up = deg((m[9] + 1) / m[5]);
+        return (
+          `view ${i} fov L${left.toFixed(1)} R${right.toFixed(1)} ` +
+          `D${down.toFixed(1)} U${up.toFixed(1)}`
+        );
+      })
+      .join(' | ');
+
+    const eyes = (
+      this.renderer.xr.getCamera() as unknown as {
+        cameras?: { viewport?: { x: number; y: number; width: number; height: number } }[];
+      }
+    ).cameras
+      ?.map((sub, i) => {
+        const v = sub.viewport;
+        return v ? `${i}:${Math.round(v.x)},${Math.round(v.y)} ${Math.round(v.width)}x${Math.round(v.height)}` : `${i}:none`;
+      })
+      .join(' ');
+
     // One flat string rather than an object: Safari collapses objects in the console and hides
     // whichever field turns out to matter.
     // A WebXR session whose render state ends up with no baseLayer and an empty layer list stops
@@ -671,14 +1344,24 @@ export class ImmersiveMode {
       | undefined;
     const layers = state?.layers === undefined ? 'unsupported' : String(state.layers.length);
 
+    // PR #34153 inlines tone mapping so this is false during the XR animation callback.
+    const needsBlit = !!(this.renderer as unknown as { needsFrameBufferTarget?: boolean })
+      .needsFrameBufferTarget;
+
     this.log(
       `frame ${this.framesSeen} | ${Math.round(elapsed / this.framesSeen)} ms/frame | ` +
         `layers ${layers} | baseLayer ${state?.baseLayer ? 'yes' : 'no'} | ` +
         `pose ${pose ? 'yes' : 'no'} | views ${pose?.views.length ?? 0} | ` +
         `eye ${eye ? `${Math.round(eye.width)}x${Math.round(eye.height)}` : 'none'} ` +
         `(aspect ${eyeAspect} vs projection ${projAspect}) | ` +
+        `viewports ${eyes ?? 'none'} | raw ${this.rawViewport} | ` +
+        `policy ${this.viewportPolicy} x${this.viewportScale.toFixed(3)} | ` +
+        `output ${needsBlit ? 'blit' : 'single-pass'} | ` +
+        `pixelRatio ${this.renderer.getPixelRatio()} | ` +
         `layer ${this.layerSize()} | target ${this.targetSize()}`,
     );
+
+    this.log(frusta || 'no views');
   }
 
   /** The nearest of `targets` along the current ray, or null. */
@@ -697,12 +1380,76 @@ export class ImmersiveMode {
    * one of the three up front matters: re-deciding mid-drag on a hand ray that wanders across an
    * edge would have the domain lurch every time the pointer clipped an obstacle.
    */
+  private cycleGizmoMode(): void {
+    if (!this.manipulator) return;
+    const i = GIZMO_MODE_ORDER.indexOf(this.manipulator.mode);
+    const next = GIZMO_MODE_ORDER[(i + 1) % GIZMO_MODE_ORDER.length]!;
+    this.manipulator.setMode(next);
+    this.panel?.setMode(next);
+  }
+
+  /**
+   * Arms or fires a double-tap. Returns true when this tap completed a double-pinch and the
+   * mode was cycled — caller should drop any drag this gesture started.
+   */
+  private notePinchTap(source: XRInputSource, kind: DragKind | undefined): boolean {
+    if (this.pinchTapNoted.get(source)) return false;
+    this.pinchTapNoted.set(source, true);
+
+    if (!this.manipulator || kind === 'scale') return false;
+
+    const now = performance.now();
+    const began = this.pinchBeganAt.get(source);
+    const duration = began === undefined ? 0 : now - began;
+    if (duration > TAP_MAX_MS) {
+      this.lastTapEnd = 0;
+      return false;
+    }
+
+    if (this.lastTapEnd > 0 && now - this.lastTapEnd <= DOUBLE_PINCH_MS) {
+      this.cycleGizmoMode();
+      this.lastTapEnd = 0;
+      return true;
+    }
+
+    this.lastTapEnd = now;
+    return false;
+  }
+
+  private cancelGestureDrag(source: XRInputSource, kind: DragKind | undefined): void {
+    this.drags.delete(source);
+    if (kind === 'object') {
+      this.grab.end();
+      this.clearScaleDrags();
+    }
+  }
+
   private onSelectStart(event: XRInputSourceEvent): void {
     // Catching a coasting domain should stop it, the way putting a hand on a globe does.
     this.velocity.yaw = 0;
     this.velocity.pitch = 0;
 
+    this.pinchBeganAt.set(event.inputSource, performance.now());
+    this.pinchTapNoted.set(event.inputSource, false);
+
     const referenceSpace = this.renderer.xr.getReferenceSpace();
+
+    // Second pinch while holding a collider: scale from inter-hand distance, not turntable pan.
+    if (this.grab.active && this.findDrag('object')) {
+      this.drags.set(event.inputSource, {
+        source: event.inputSource,
+        kind: 'scale',
+        started: false,
+        yaw: 0,
+        pitch: 0,
+        x: 0,
+        y: 0,
+        z: 0,
+      });
+      if (referenceSpace) this.syncTwoHandScale(event.frame, referenceSpace);
+      return;
+    }
+
     let kind: DragKind = 'turntable';
 
     if (referenceSpace && this.readRay(event.inputSource, event.frame, referenceSpace)) {
@@ -721,10 +1468,19 @@ export class ImmersiveMode {
         return;
       }
 
+      const actionHit =
+        this.actionPanel?.visible ? this.pick(this.actionPanel.targets) : null;
+      if (actionHit && this.actionPanel?.handlePick(actionHit)) {
+        return;
+      }
+
       const target = this.manipulator ? this.pick(this.manipulator.targets()) : null;
       if (target && this.manipulator) {
         this.manipulator.selectObject(target);
-        this.grab.begin(target, this.ray, this.manipulator.mode);
+        const wrist = this.readWrist(event.inputSource, event.frame, referenceSpace, wristA)
+          ? wristA
+          : null;
+        this.grab.begin(target, this.ray, this.manipulator.mode, wrist);
         kind = 'object';
       } else {
         this.manipulator?.selectObject(null);
@@ -741,13 +1497,64 @@ export class ImmersiveMode {
       pitch: 0,
       x: 0,
       y: 0,
+      z: 0,
     });
+
+    // Second pinch: drop into pan and re-origin both hands so the turntable doesn't keep spinning.
+    if (kind === 'turntable' && this.turntableCount() >= 2) {
+      this.velocity.yaw = 0;
+      this.velocity.pitch = 0;
+      for (const drag of this.drags.values()) {
+        if (drag.kind === 'turntable') drag.started = false;
+      }
+    }
+  }
+
+  /**
+   * WebXR fires `select` between start and end for a completed primary action. Prefer it for
+   * double-tap; `selectend` repeats the same note if `select` was skipped (seen on some
+   * transient-pointer paths).
+   */
+  private onSelect(event: XRInputSourceEvent): void {
+    const drag = this.drags.get(event.inputSource);
+    if (this.notePinchTap(event.inputSource, drag?.kind)) {
+      this.cancelGestureDrag(event.inputSource, drag?.kind);
+    }
   }
 
   private onSelectEnd(event: XRInputSourceEvent): void {
     const drag = this.drags.get(event.inputSource);
-    if (drag?.kind === 'object') this.grab.end();
+    const kind = drag?.kind;
+
+    if (this.notePinchTap(event.inputSource, kind)) {
+      this.cancelGestureDrag(event.inputSource, kind);
+      return;
+    }
+
     this.drags.delete(event.inputSource);
+
+    if (kind === 'scale') {
+      const remaining = this.findDrag('object');
+      const referenceSpace = this.renderer.xr.getReferenceSpace();
+      if (
+        remaining &&
+        referenceSpace &&
+        this.readWrist(remaining.source, event.frame, referenceSpace, wristA)
+      ) {
+        this.grab.resumeWrist(wristA);
+      }
+      return;
+    }
+
+    if (kind === 'object') {
+      this.grab.end();
+      this.clearScaleDrags();
+    }
+
+    // Leaving a two-handed pan: re-origin the remaining pinch so turntable doesn't hitch.
+    for (const remaining of this.drags.values()) {
+      if (remaining.kind === 'turntable') remaining.started = false;
+    }
   }
 
   /** Applies a turn, keeping the tip within limits so the box can never end up inverted. */
@@ -774,50 +1581,103 @@ export class ImmersiveMode {
     if (frame) {
       this.framesSeen++;
       this.targetReady = this.sizeXRTarget();
-      this.clampViewports();
+      this.fitViewports();
+      this.cropFrusta();
       if (referenceSpace) this.requestViewportScale(frame, referenceSpace);
+
+      if (this.pendingAnchor && referenceSpace) {
+        const pose = frame.getViewerPose(referenceSpace);
+        if (pose) {
+          this.anchorFromViewer(pose);
+          this.pendingAnchor = false;
+        }
+      }
+
       if (this.debugViews && referenceSpace && this.framesSeen === 2) {
         this.dumpSubImages(frame, referenceSpace);
       }
-      if (FRAME_REPORTS.has(this.framesSeen)) this.reportFrame(frame, referenceSpace);
-    }
-
-    if (frame && referenceSpace) {
-      for (const drag of this.drags.values()) {
-        const pose = frame.getPose(drag.source.targetRaySpace, referenceSpace);
-        if (!pose) continue;
-
-        // A pinch that picked something up moves that and nothing else — the domain stays put
-        // under it, so you can place a primitive against a part of the fire you can still see.
-        if (drag.kind === 'object') {
-          if (this.readRay(drag.source, frame, referenceSpace)) this.grab.move(this.ray);
-          continue;
-        }
-
-        const { yaw, pitch } = aim(pose.transform.orientation, this.direction);
-        const { x, y } = pose.transform.position;
-
-        if (drag.started) {
-          const dYaw = -angleDelta(drag.yaw, yaw) * AIM_GAIN + (x - drag.x) * REACH_GAIN;
-          const dPitch = angleDelta(drag.pitch, pitch) * AIM_GAIN + (y - drag.y) * REACH_GAIN;
-
-          this.turn(dYaw, dPitch);
-
-          if (dt > 0) {
-            this.velocity.yaw = smoothSpin(this.velocity.yaw, dYaw / dt);
-            this.velocity.pitch = smoothSpin(this.velocity.pitch, dPitch / dt);
-          }
-        }
-
-        drag.started = true;
-        drag.yaw = yaw;
-        drag.pitch = pitch;
-        drag.x = x;
-        drag.y = y;
+      if (FRAME_REPORTS.has(this.framesSeen) || this.reportNext) {
+        this.reportNext = false;
+        this.reportFrame(frame, referenceSpace);
       }
     }
 
-    if (this.drags.size > 0) return;
+    if (frame && referenceSpace) {
+      if (this.syncTwoHandScale(frame, referenceSpace)) {
+        // Holding a collider with two pinches: scale only — leave the turntable alone.
+      } else {
+        const panning = this.turntableCount() >= 2;
+        let panDx = 0;
+        let panDy = 0;
+        let panDz = 0;
+        let panSamples = 0;
+
+        for (const drag of this.drags.values()) {
+          if (drag.kind === 'scale') continue;
+
+          // A pinch that picked something up moves that and nothing else — the domain stays put
+          // under it, so you can place a primitive against a part of the fire you can still see.
+          if (drag.kind === 'object') {
+            if (this.manipulator?.mode === 'translate') {
+              if (this.readWrist(drag.source, frame, referenceSpace, wristA)) {
+                if (!drag.started) {
+                  this.grab.resumeWrist(wristA);
+                  drag.started = true;
+                } else {
+                  this.grab.moveWrist(wristA);
+                }
+              }
+            } else if (this.readRay(drag.source, frame, referenceSpace)) {
+              this.grab.move(this.ray);
+              drag.started = true;
+            }
+            continue;
+          }
+
+          const pose = frame.getPose(drag.source.targetRaySpace, referenceSpace);
+          if (!pose) continue;
+
+          const { yaw, pitch } = aim(pose.transform.orientation, this.direction);
+          const { x, y, z } = pose.transform.position;
+
+          if (drag.started) {
+            if (panning) {
+              // Two hands: average travel pans the table in front of you.
+              panDx += x - drag.x;
+              panDy += y - drag.y;
+              panDz += z - drag.z;
+              panSamples++;
+            } else if (this.turntableEnabled) {
+              const dYaw = -angleDelta(drag.yaw, yaw) * AIM_GAIN + (x - drag.x) * REACH_GAIN;
+              const dPitch = angleDelta(drag.pitch, pitch) * AIM_GAIN + (y - drag.y) * REACH_GAIN;
+
+              this.turn(dYaw, dPitch);
+
+              if (dt > 0) {
+                this.velocity.yaw = smoothSpin(this.velocity.yaw, dYaw / dt);
+                this.velocity.pitch = smoothSpin(this.velocity.pitch, dPitch / dt);
+              }
+            }
+          }
+
+          drag.started = true;
+          drag.yaw = yaw;
+          drag.pitch = pitch;
+          drag.x = x;
+          drag.y = y;
+          drag.z = z;
+        }
+
+        if (panning && panSamples > 0) {
+          const inv = PAN_GAIN / panSamples;
+          this.applyPan(panDx * inv, panDy * inv, panDz * inv);
+          this.velocity.yaw = 0;
+          this.velocity.pitch = 0;
+        }
+      }
+    }
+
+    if (this.drags.size > 0 || !this.turntableEnabled) return;
 
     // Let go and it keeps turning for a moment, then settles.
     const decay = Math.pow(SPIN_RETENTION, dt);

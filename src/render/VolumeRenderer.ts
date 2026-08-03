@@ -100,9 +100,9 @@ export class VolumeRenderer {
     exposure: uniform(1),
     flameIntensity: uniform(1),
     hollowFlame: uniform(0.85),
-    sootDensity: uniform(26),
-    sootAlbedo: uniform(0.32),
-    smokeAmbient: uniform(0.06),
+    sootDensity: uniform(280),
+    sootAlbedo: uniform(0.28),
+    smokeAmbient: uniform(0.16),
     koraDiffusion: uniform(0.35),
     koraCrust: uniform(0.3),
     showFlameFront: uniform(0),
@@ -145,6 +145,14 @@ export class VolumeRenderer {
     this.mesh = new Mesh(geometry, material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = 10;
+  }
+
+  dispose(): void {
+    this.mesh.geometry.dispose();
+    const material = this.mesh.material;
+    if (Array.isArray(material)) material.forEach((m) => m.dispose());
+    else material.dispose();
+    this.lut.dispose();
   }
 
   private buildShader(inputs: VolumeInputs) {
@@ -266,9 +274,11 @@ export class VolumeRenderer {
           u.showFlameFront,
         );
 
-        const emission = bodyColour
-          .mul(flameAlpha.mul(u.flameIntensity).add(shadedSoot.mul(0.06)))
-          .mul(debugTint);
+        // §5.4.1: flame colour is blackbody(T) driven by the heat channel. Soot is a separate
+        // medium — "using its concentration to drive alpha and mapping a shade of gray to its
+        // color". Multiplying soot into the blackbody made the plume read as warm amber haze
+        // instead of creosote, and hid the smoke even when the soot field was clearly populated.
+        const emission = bodyColour.mul(flameAlpha.mul(u.flameIntensity)).mul(debugTint);
 
         // Debug: max-intensity projection of one scalar, bypassing compositing. Channels 1-4 are
         // raw solver outputs; 5-7 step through the shading chain so a black frame can be
@@ -296,7 +306,10 @@ export class VolumeRenderer {
         // include it: a clean premixed flame makes no soot, and on soot alone it would composite
         // at zero opacity and vanish however bright its emission.
         const sootSigma = shadedSoot.mul(u.sootDensity);
-        const sigma = sootSigma.add(flameAlpha.mul(u.flameIntensity));
+        // Flame emits strongly but should not seal the ray: if extinction tracked emission 1:1,
+        // a luminous core went fully opaque and erased the creosote sitting in the same column.
+        const flameSigma = flameAlpha.mul(u.flameIntensity).mul(0.28);
+        const sigma = sootSigma.add(flameSigma);
         const alpha = oneMinus(exp(sigma.negate().mul(ds)));
 
         // What fraction of the extinction here is soot rather than reaction zone. The in-scatter
@@ -306,25 +319,27 @@ export class VolumeRenderer {
         const sootShare = sootSigma.div(max(sigma, float(1e-6)));
 
         // Cheap self-shadowing: the blurred soot doubles as an occlusion estimate, so deep
-        // smoke sits in shadow without paying for a per-step shadow ray.
-        const shadow = exp(b.z.mul(-2.2));
-        const scattered = vec3(0.55, 0.6, 0.72)
-          .add(vec3(1.0, 0.72, 0.42).mul(2.0).mul(shadow))
-          .mul(u.smokeAmbient)
-          .mul(u.sootAlbedo);
+        // smoke sits in shadow without paying for a per-step shadow ray. Scale with sootDensity
+        // so the occlusion estimate tracks the same extinction the march uses.
+        const shadow = exp(b.z.mul(u.sootDensity).mul(-0.045));
+        const sootGrey = vec3(0.12, 0.11, 0.1);
+        const sunBleed = vec3(0.35, 0.28, 0.18).mul(shadow);
+        const scattered = sootGrey.add(sunBleed).mul(u.smokeAmbient).mul(u.sootAlbedo);
 
+        // Soot extinction is absorptive: grey in-scatter is the only light it adds, so a thick
+        // plume goes dark against the backdrop instead of picking up the flame's blackbody.
+        const sootAlpha = oneMinus(exp(sootSigma.negate().mul(ds)));
         radiance.addAssign(
-          transmittance.mul(emission.mul(ds).add(scattered.mul(alpha).mul(sootShare))),
+          transmittance.mul(emission.mul(ds).add(scattered.mul(sootAlpha).mul(sootShare))),
         );
         transmittance.mulAssign(oneMinus(alpha));
 
         t.addAssign(ds);
       });
 
-      const shaded = vec4(
-        radiance.mul(u.exposure),
-        clamp(oneMinus(transmittance), float(0.0), float(1.0)),
-      );
+      // Premultiplied output: rgb already includes extinction, a is opacity for the backdrop.
+      const opacity = clamp(oneMinus(transmittance), float(0.0), float(1.0));
+      const shaded = vec4(radiance.mul(u.exposure), opacity);
 
       const peak = clamp(debugPeak, float(0.0), float(1.0));
       const debug = vec4(vec3(peak.pow(0.6)), float(1.0));

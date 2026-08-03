@@ -16,7 +16,7 @@ import {
   type Scene,
   type Texture,
 } from 'three/webgpu';
-import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
 
 export const ENVIRONMENTS = ['void', 'studio', 'dusk', 'daylight', 'night'] as const;
 export type EnvironmentName = (typeof ENVIRONMENTS)[number];
@@ -46,7 +46,7 @@ const VOID_COLOUR = 0x05060a;
 
 export class Environment {
   private readonly cache = new Map<EnvironmentName, Texture>();
-  private readonly loader = new RGBELoader();
+  private readonly loader = new HDRLoader();
   private readonly fallback = new Color(VOID_COLOUR);
   /** Guards against a slow load landing after the user has moved on to another backdrop. */
   private pending = 0;

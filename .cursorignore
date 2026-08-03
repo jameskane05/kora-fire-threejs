@@ -1,0 +1,10 @@
+# Keep Cursor indexing / search off heavy trees (TS + three.js explode memory).
+node_modules/
+dist/
+.git/
+**/*.min.js
+**/three/build/
+**/three/examples/
+**/three/test/
+**/three/src/
+agent-transcripts/

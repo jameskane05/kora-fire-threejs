@@ -32,7 +32,7 @@ import { Environment, DEFAULT_INTENSITY, type EnvironmentName } from './scene/En
 import { Sparks } from './particles/Sparks';
 import type { ObstacleKind } from './sim/obstacles';
 import { Hands, previewHand } from './xr/Hands';
-import { ImmersiveMode } from './xr/ImmersiveMode';
+import { ImmersiveMode, type ViewportPolicy } from './xr/ImmersiveMode';
 
 const app = document.getElementById('app') as HTMLDivElement;
 const statsEl = document.getElementById('stats') as HTMLDivElement;
@@ -60,7 +60,7 @@ async function main() {
 
   // trackTimestamp only arms the query pool; nothing is resolved until the profiler asks.
   const renderer = new WebGPURenderer({
-    antialias: false,
+    antialias: true, // WebGPU XR MSAA: three #34120
     forceWebGL: false,
     requiredLimits,
     trackTimestamp: true,
@@ -228,6 +228,7 @@ async function main() {
     sparks.mesh.removeFromParent();
     sparks.dispose();
     solver.dispose();
+    volume.dispose();
 
     solver = new KoraSolver(renderer, params, noise);
     volume = new VolumeRenderer(
@@ -261,7 +262,18 @@ async function main() {
    * duration and put back on exit, since a fire that judders is worse than one with less detail.
    */
   const IMMERSIVE_QUALITY: Quality = 'performance';
+  /** Raymarch steps while presenting — dual 2048² eyes cannot carry the desktop count. */
+  const IMMERSIVE_RAYMARCH_STEPS = 32;
   let qualityBeforeXR: Quality | null = null;
+  let raymarchBeforeXR: number | null = null;
+  /**
+   * Frames after the XR target is ready that draw reference geometry only.
+   *
+   * The first immersive submits recompile materials for the ArrayCamera / single-pass path and
+   * routinely take close to a second on visionOS; the compositor ends the session before the
+   * fire ever gets a chance. Cheap frames keep the session alive until that cost is paid.
+   */
+  let xrWarmupLeft = 0;
 
   /**
    * Session debug switches, as query parameters so a headset can be sent straight to a URL.
@@ -295,24 +307,38 @@ async function main() {
       rebuild();
     }
 
+    raymarchBeforeXR = params.raymarchSteps;
+    params.raymarchSteps = Math.min(params.raymarchSteps, IMMERSIVE_RAYMARCH_STEPS);
+    volume.update(params, frame);
+    xrWarmupLeft = 20;
+    scoped = 0;
+
     if (flatXR) {
       renderer.toneMapping = NoToneMapping;
       renderer.outputColorSpace = LinearSRGBColorSpace;
     }
 
-    // Read after the tier has settled: this is the only thing standing between the raymarcher and
-    // the headset's full recommended resolution, which is far more pixels than it can carry.
-    immersive.setLayerScale(QUALITY[params.quality].xrScale);
+    // The tier's `xrScale` is deliberately not applied. visionOS quotes a sub-image larger than the
+    // layer it allocates, so `ImmersiveMode` owns the layer scale there — it is measuring its way
+    // up to a texture that can hold the eye, not down to one that is cheap to fill. The tiers pay
+    // in solver resolution and raymarch steps instead.
   }
 
   function exitImmersive() {
     controls.enabled = true;
     obstacles.setGizmoEnabled(true);
     applyPixelRatio(params.quality);
+    xrWarmupLeft = 0;
 
     if (flatXR) {
       renderer.toneMapping = ACESFilmicToneMapping;
       renderer.outputColorSpace = SRGBColorSpace;
+    }
+
+    if (raymarchBeforeXR !== null) {
+      params.raymarchSteps = raymarchBeforeXR;
+      raymarchBeforeXR = null;
+      volume.update(params, frame);
     }
 
     if (qualityBeforeXR) {
@@ -449,6 +475,23 @@ async function main() {
       console.table(status);
       return status;
     },
+    // Switchable mid-session: a warped image is one of a few placements of the frustum inside the
+    // eye attachment, and looking at each is faster than deducing which the compositor wants.
+    xrViewport: (policy: ViewportPolicy = 'full') => immersive.setViewportPolicy(policy),
+    // The correction for a compositor that samples further across the layer than the layer goes.
+    // Off renders the whole frustum into the corner it does not fit, which is the warp itself.
+    xrCrop: (on = true) => {
+      immersive.frustumCrop = on;
+      return `frustum crop ${on ? 'on' : 'off'}`;
+    },
+    // three defaults this to 1 (max). 0 is Ada's "don't apply foveation twice" workaround.
+    xrFoveation: (level = 0) => {
+      renderer.xr.setFoveation(level);
+      return renderer.xr.getFoveation();
+    },
+    xrViewportScale: (scale = 1) => immersive.setViewportScale(scale),
+    // Only takes effect on the next session; a projection layer is fixed in size once built.
+    xrLayerScale: (scale = 1) => immersive.setLayerScale(scale),
     xrBisect: (on = true) => {
       bisect = on;
       return `session rendering ${on ? 'reference geometry only' : 'everything'}`;
@@ -580,26 +623,37 @@ async function main() {
     bloomPass.strength.value = params.bloom;
     environment.setIntensity(params.backgroundIntensity);
 
-    // With the bisect on, a session draws the reference geometry and nothing else: no solve, no
-    // particles, no raymarch. A session that stays open like that is one whose only problem is
-    // what the fire costs, which is a different repair from one whose plumbing is wrong.
+    // Bisect strips everything for plumbing diagnosis. Warmup keeps the volume visible so its
+    // shaders compile under a live session, but skips the solver and sparks — the compositor
+    // ends a session that spends a second on the first immersive submits.
+    const warming = immersive.rendering && xrWarmupLeft > 0;
     const stripped = bisect && immersive.active;
+    const simulate = !stripped && !warming;
 
-    if (!stripped) {
+    if (simulate) {
       // Before the step, so the velocity a dragged primitive picked up this frame is the boundary
       // flux the projection sees rather than one frame stale.
       obstacles.update(dt);
-      solver.step(dt);
+      // Stereo raymarching already owns the frame; step the solver every other tick in a session.
+      if (!immersive.active || frame % 2 === 0) {
+        solver.step(dt);
+      }
       volume.update(params, frame++);
 
       // After the step, so the embers spawn from the reaction zone and ride the velocity field
-      // this frame actually produced rather than last frame's.
+      // this frame actually produced rather than last frame's. Sparks are off in XR — dual-eye
+      // overdraw for a garnish the session cannot afford.
       sparks.update(params);
-      if (params.sparksEnabled) sparks.step(renderer, solver.currentParity, dt, frame);
+      if (params.sparksEnabled && !immersive.active) {
+        sparks.step(renderer, solver.currentParity, dt, frame);
+      }
+    } else if (!stripped) {
+      // Warmup still needs the volume's uniforms current for the compile/draw.
+      volume.update(params, frame);
     }
 
     volume.mesh.visible = !stripped;
-    sparks.mesh.visible = !stripped && params.sparksEnabled;
+    sparks.mesh.visible = !stripped && params.sparksEnabled && !immersive.active;
 
     if (immersive.active) {
       immersive.update(xrFrame ?? null, dt);
@@ -614,6 +668,12 @@ async function main() {
         // the XR projection layer's per-eye array texture will accept. In a session the volume
         // goes straight to the eye buffers and loses its glow.
         renderXR();
+        if (xrWarmupLeft > 0) {
+          xrWarmupLeft--;
+          if (xrWarmupLeft === 0) {
+            console.info('[kora/xr] warmup done, enabling the fire');
+          }
+        }
       }
     } else {
       controls.update();

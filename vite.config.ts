@@ -10,5 +10,21 @@ export default defineConfig(({ command }) => ({
   base: command === 'build' ? '/kora-fire-threejs/' : '/',
   plugins: [basicSsl()],
   server: { port: 5273, host: true, open: false },
-  build: { target: 'esnext' },
+  // three is pinned to a git commit and rebuilt in postinstall. Keep it out of the
+  // dep optimizer so Vite does not serve a stale prebundle after that rebuild.
+  optimizeDeps: {
+    exclude: ['three'],
+  },
+  build: {
+    target: 'esnext',
+    // cube.html is the bare WebGPU/WebXR baseline; without naming it here a build drops it.
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        fire: 'fire.html',
+        cube: 'cube.html',
+        materials: 'materials.html',
+      },
+    },
+  },
 }));

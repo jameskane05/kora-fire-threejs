@@ -157,3 +157,36 @@ Anything that shows whether the compositor received and released frame 1 — spe
 its completion sync event. Failing that, confirmation that a WebGPU-backed session has ever
 presented more than two frames on this platform would tell us whether to keep debugging the app or
 stop.
+
+## Multiview / view-instancing spike
+
+WebGPU’s draft [`view-instancing`](https://github.com/gpuweb/gpuweb/blob/main/proposals/view-instancing.md)
+feature (`GPURenderPassDescriptor.viewCount`, WGSL `@builtin(view_index)`) is the only path that
+could share one shaded pass across both XR eyes. three.js does not use it on WebGPU XR today.
+Fragment work still runs per eye when it works — the win is encode/geometry, not half the
+raymarch fill.
+
+Harness: [`cube.html`](../cube.html) + [`src/cube.ts`](../src/cube.ts).
+
+| URL | Behaviour |
+| --- | --- |
+| `/cube.html?native=1` | Dual-pass baseline (one render pass per eye) |
+| `/cube.html?native=1&multiview=1` | Probe feature + 2-layer array view + `viewCount: 2`; falls back to dual-pass on any kill |
+| `&stress=256` | Extra cube draws for geometry/encode A/B |
+
+Console markers to collect on visionOS Safari:
+
+1. `adapter multiview-related:` / `view-instancing feature:` — feature present or `unsupported`
+2. `array probe | ok=… shared=… reportedLayers=…` — whether a `2d-array` view with 2 layers is legal despite WebKit’s `depthOrArrayLayers === 1` misreport
+3. `frame N | mode multiview|dual-pass | passes … | draws … | dt … | encode …` and `GPU done in … ms`
+4. Any `multiview: kill — …` line
+
+### Kill / proceed (device)
+
+| Result | Decision |
+| --- | --- |
+| Feature absent, array view rejected, or `viewCount` validation fails | **Kill** — stay on three dual-eye; no three.js rip for multiview |
+| Multiview stable but cube/`stress` win tiny | **Kill migration**; optional note for bead-heavy native present later |
+| Multiview stable + clear win on high `stress` | Follow-up plan for native XR present of MPM beads / optional volume |
+
+**Status (harness landed, awaiting AVP console capture):** treat as **unsupported until proven**. The draft feature is not known to ship in WebKit; the first `?native=1&multiview=1` session on device should log `view-instancing feature: unsupported` or a kill line and keep dual-pass. Paste those lines here when measured and flip this status to supported or confirmed kill.
