@@ -45,7 +45,10 @@ const DEFAULT_FRAMED_SIZE = 0.42;
  * ray origins barely move when you pull both hands toward yourself — wrists do.
  */
 const PAN_GAIN = 1.15;
-const PAN_LIMIT = { x: 0.7, y: 0.45, z: 0.55 };
+// Loose bounds that only stop the stage being flung out of reach entirely. Vertical is the
+// widest: physics presets get framed at standing height and want dragging down to a floor game
+// or up to eye level.
+const PAN_LIMIT = { x: 1.0, y: 1.4, z: 0.8 };
 
 /** Two-hand pinch: pull apart / pinch together scales `framedSize` (rig world size). */
 const FRAMED_SIZE_MIN = 0.14;
@@ -56,6 +59,28 @@ const FRAMED_SIZE_MAX = 0.95;
  * shifted down by about a standing eye height so a “table at 0.9 m” still lands near the lap.
  */
 const LOCAL_EYE_HEIGHT = 1.5;
+
+/**
+ * Frames to give tracking before anchoring to a pose the runtime still calls emulated. Past this
+ * the guess is better than leaving the stage at the reference-space origin.
+ */
+const ANCHOR_SETTLE_FRAMES = 30;
+
+/**
+ * Whether the runtime will give us a floor-relative origin.
+ *
+ * Asked by requesting the space rather than reading `session.enabledFeatures`, which is optional
+ * in the spec and absent on some runtimes. Treating a missing array as "no floor" drops us onto
+ * the eye-height guess below, and that puts the scene at a different height on every entry.
+ */
+async function hasFloorOrigin(session: XRSession): Promise<boolean> {
+  try {
+    await session.requestReferenceSpace('local-floor');
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Two gains, because a pinch is read from two signals at once.
@@ -235,10 +260,25 @@ export interface Manipulator {
 }
 
 /**
- * A pinch either turns the whole domain, moves one thing inside it, or (as a second hand while
- * something is held) drives two-hand scale. Kind is decided once when the pinch begins.
+ * A simulated body a pointer can grab, for content with no pickable Object3D of its own.
+ *
+ * Instanced physics bodies have no per-body mesh to raycast, so this hands the pointer ray to
+ * the owner and lets it do the pick against its own broadphase.
  */
-type DragKind = 'turntable' | 'object' | 'scale';
+export interface BodyPointer {
+  /** Try to take hold of something along this reference-space ray. True if it caught. */
+  tryGrab(ray: PointerRay): boolean;
+  /** Once per frame while held. `wrist` is reference-space, null when the runtime has none. */
+  moveGrab(ray: PointerRay, wrist: Vector3 | null): void;
+  endGrab(): void;
+}
+
+/**
+ * A pinch either turns the whole domain, moves one thing inside it, drags a simulated body, or
+ * (as a second hand while something is held) drives two-hand scale. Kind is decided once when
+ * the pinch begins.
+ */
+type DragKind = 'turntable' | 'object' | 'body' | 'scale';
 
 interface Drag {
   source: XRInputSource;
@@ -259,6 +299,11 @@ export interface PlacementOptions {
   height?: number;
   /** World size the domain is scaled to fit, in metres. */
   framedSize?: number;
+  /**
+   * Limits for the two-handed scale gesture, in metres. Physics presets want a wider range than
+   * the fire/MPM domains — you resize to bring a part of the sim within arm's reach.
+   */
+  framedSizeRange?: { min: number; max: number };
   /**
    * One-pinch turntable. Default on (fire). Materials leaves it off so a pinch is free for
    * stirring; two pinches still pan.
@@ -339,11 +384,14 @@ export class ImmersiveMode {
   private panel: ModePanel | null = null;
   private actionPanel: ActionPanel | null = null;
   private manipulator: Manipulator | null = null;
+  private bodyPointer: BodyPointer | null = null;
   /** Sandbox folds gizmo mode into its paginated HUD; the legacy strip stays off there. */
   private modePanelEnabled = true;
   private domainSize = 1;
   private placement = { ...DEFAULT_PLACEMENT };
   private framedSize = DEFAULT_FRAMED_SIZE;
+  private framedSizeMin = FRAMED_SIZE_MIN;
+  private framedSizeMax = FRAMED_SIZE_MAX;
   private turntableEnabled = true;
   /** Floor-relative placement is valid (local-floor); otherwise heights are eye-relative. */
   private usesFloorOrigin = true;
@@ -356,6 +404,8 @@ export class ImmersiveMode {
     -DEFAULT_PLACEMENT.distance,
   );
   private readonly anchorForward = new Vector3(0, 0, -1);
+  /** HUD position before pan, set from the viewer alongside `anchorBase`. */
+  private readonly hudBase = new Vector3();
   /** Extra translation from two-handed pan, in metres (reference space). */
   private readonly panOffset = new Vector3();
   /** Baseline for two-hand domain scale (pull apart → larger framedSize). */
@@ -412,6 +462,15 @@ export class ImmersiveMode {
     }
     this.panel.setMode(manipulator.mode);
     this.panel.setVisible(this.modePanelEnabled && this.session !== null);
+  }
+
+  /**
+   * Supplies something a pinch may grab out of a simulation. Picked after the HUD panels and
+   * before the Object3D manipulator; pass null when the active exhibit has no bodies.
+   */
+  setBodyPointer(pointer: BodyPointer | null): void {
+    if (this.bodyPointer && this.bodyPointer !== pointer) this.bodyPointer.endGrab();
+    this.bodyPointer = pointer;
   }
 
   /** Hide the legacy move/turn/size strip when a sandbox HUD owns that affordance. */
@@ -818,7 +877,12 @@ export class ImmersiveMode {
   setPlacement(options: PlacementOptions): void {
     if (options.distance !== undefined) this.placement.distance = options.distance;
     if (options.height !== undefined) this.placement.height = options.height;
+    if (options.framedSizeRange !== undefined) {
+      this.framedSizeMin = options.framedSizeRange.min;
+      this.framedSizeMax = options.framedSizeRange.max;
+    }
     if (options.framedSize !== undefined) this.framedSize = options.framedSize;
+    this.framedSize = Math.max(this.framedSizeMin, Math.min(this.framedSizeMax, this.framedSize));
     if (options.turntable !== undefined) {
       this.turntableEnabled = options.turntable;
       if (!this.turntableEnabled) {
@@ -842,6 +906,7 @@ export class ImmersiveMode {
           this.usesFloorOrigin ? this.placement.height : this.placement.height - LOCAL_EYE_HEIGHT,
           -this.placement.distance,
         );
+        this.hudBase.set(0, this.usesFloorOrigin ? 0 : -LOCAL_EYE_HEIGHT, 0);
         this.applyRigPose();
       }
     } else {
@@ -851,6 +916,7 @@ export class ImmersiveMode {
       this.rig.position.set(0, this.domainSize / 2, 0);
       this.pivot.rotation.set(0, 0, 0);
       this.panOffset.set(0, 0, 0);
+      this.hudBase.set(0, 0, 0);
       this.hud.position.set(0, 0, 0);
       this.hud.rotation.set(0, 0, 0);
       this.anchorBase.set(0, this.placement.height, -this.placement.distance);
@@ -862,6 +928,13 @@ export class ImmersiveMode {
       this.anchorBase.x + this.panOffset.x,
       this.anchorBase.y + this.panOffset.y,
       this.anchorBase.z + this.panOffset.z,
+    );
+    // The HUD travels with the stage. Leaving it on its original anchor meant dragging the sim
+    // down to where you could reach it stranded the buttons back where the sim used to be.
+    this.hud.position.set(
+      this.hudBase.x + this.panOffset.x,
+      this.hudBase.y + this.panOffset.y,
+      this.hudBase.z + this.panOffset.z,
     );
   }
 
@@ -894,17 +967,17 @@ export class ImmersiveMode {
       y,
       p.z + this.anchorForward.z * this.placement.distance,
     );
+    // HUD stays in reference space, yawed to face the user; panels keep their local offsets.
+    this.hudBase.set(p.x, this.usesFloorOrigin ? 0 : p.y - LOCAL_EYE_HEIGHT, p.z);
     this.panOffset.set(0, 0, 0);
     this.applyRigPose();
-
-    // HUD stays in reference space, yawed to face the user; panels keep their local offsets.
-    const hudY = this.usesFloorOrigin ? 0 : p.y - LOCAL_EYE_HEIGHT;
-    this.hud.position.set(p.x, hudY, p.z);
     this.hud.rotation.set(0, Math.atan2(-this.anchorForward.x, -this.anchorForward.z), 0);
 
     this.log(
       `anchored stage | floor=${this.usesFloorOrigin} | ` +
-        `base (${this.anchorBase.x.toFixed(2)}, ${this.anchorBase.y.toFixed(2)}, ${this.anchorBase.z.toFixed(2)})`,
+        `base (${this.anchorBase.x.toFixed(2)}, ${this.anchorBase.y.toFixed(2)}, ${this.anchorBase.z.toFixed(2)})` +
+        ` | viewer y ${p.y.toFixed(2)} | domain ${this.domainSize.toFixed(2)}m` +
+        ` framed ${this.framedSize.toFixed(2)}m`,
     );
   }
 
@@ -1082,8 +1155,9 @@ export class ImmersiveMode {
     session.addEventListener('select', this.onSelect);
     session.addEventListener('selectend', this.onSelectEnd);
 
-    this.usesFloorOrigin = session.enabledFeatures?.includes('local-floor') ?? false;
+    this.usesFloorOrigin = await hasFloorOrigin(session);
     this.renderer.xr.setReferenceSpaceType(this.usesFloorOrigin ? 'local-floor' : 'local');
+    this.log(`reference space ${this.usesFloorOrigin ? 'local-floor' : 'local (eye-relative)'}`);
 
     // onEnter picks the immersive quality tier, which is where the layer scale comes from, so the
     // shim has to go in after it and before three builds the layer inside setSession.
@@ -1156,6 +1230,7 @@ export class ImmersiveMode {
     this.renderer.setPixelRatio(this.pixelRatioBeforeXR);
     this.drags.clear();
     this.grab.end();
+    this.bodyPointer?.endGrab();
     this.velocity.yaw = 0;
     this.velocity.pitch = 0;
     this.lastTapEnd = 0;
@@ -1197,6 +1272,10 @@ export class ImmersiveMode {
    * visionOS often exposes the pinch as a transient-pointer without `source.hand`, while the
    * tracked skeleton lives on a separate hand source — so this also searches session hands and
    * picks the wrist nearest the gaze ray.
+   *
+   * Returns false when no wrist can be read. It deliberately does not fall back to the ray origin:
+   * a transient-pointer ray is anchored near the shoulder, so substituting it silently moves the
+   * reported hand half a metre and callers differencing successive wrists see that as real travel.
    */
   private readWrist(
     source: XRInputSource,
@@ -1245,10 +1324,7 @@ export class ImmersiveMode {
         found = true;
       }
     }
-    if (found) return true;
-
-    out.copy(this.ray.origin);
-    return true;
+    return found;
   }
 
   private readWristFromHand(
@@ -1329,8 +1405,8 @@ export class ImmersiveMode {
 
     const ratio = dist / this.domainScaleGesture.startDist;
     const next = Math.max(
-      FRAMED_SIZE_MIN,
-      Math.min(FRAMED_SIZE_MAX, this.domainScaleGesture.startFramed * ratio),
+      this.framedSizeMin,
+      Math.min(this.framedSizeMax, this.domainScaleGesture.startFramed * ratio),
     );
     if (Math.abs(next - this.framedSize) < 1e-4) return;
     this.framedSize = next;
@@ -1453,7 +1529,7 @@ export class ImmersiveMode {
     if (this.pinchTapNoted.get(source)) return false;
     this.pinchTapNoted.set(source, true);
 
-    if (!this.manipulator || kind === 'scale') return false;
+    if (!this.manipulator || kind === 'scale' || kind === 'body') return false;
 
     const now = performance.now();
     const began = this.pinchBeganAt.get(source);
@@ -1479,6 +1555,7 @@ export class ImmersiveMode {
       this.grab.end();
       this.clearScaleDrags();
     }
+    if (kind === 'body') this.bodyPointer?.endGrab();
   }
 
   private onSelectStart(event: XRInputSourceEvent): void {
@@ -1528,6 +1605,20 @@ export class ImmersiveMode {
       const actionHit =
         this.actionPanel?.visible ? this.pick(this.actionPanel.targets) : null;
       if (actionHit && this.actionPanel?.handlePick(actionHit)) {
+        return;
+      }
+
+      if (this.bodyPointer?.tryGrab(this.ray)) {
+        this.drags.set(event.inputSource, {
+          source: event.inputSource,
+          kind: 'body',
+          started: false,
+          yaw: 0,
+          pitch: 0,
+          x: 0,
+          y: 0,
+          z: 0,
+        });
         return;
       }
 
@@ -1609,6 +1700,8 @@ export class ImmersiveMode {
       this.clearScaleDrags();
     }
 
+    if (kind === 'body') this.bodyPointer?.endGrab();
+
     // Leaving a two-handed pan/scale: re-origin the remaining pinch so turntable doesn't hitch.
     this.domainScaleGesture = null;
     for (const remaining of this.drags.values()) {
@@ -1646,7 +1739,11 @@ export class ImmersiveMode {
 
       if (this.pendingAnchor && referenceSpace) {
         const pose = frame.getViewerPose(referenceSpace);
-        if (pose) {
+        // An emulated pose is the runtime's guess at where the head is, and the head height is
+        // exactly what the eye-relative placement is measured from — anchoring to a guess is how
+        // the stage ends up at a different height every time.
+        const settled = pose && (!pose.emulatedPosition || this.framesSeen > ANCHOR_SETTLE_FRAMES);
+        if (pose && settled) {
           this.anchorFromViewer(pose);
           this.pendingAnchor = false;
         }
@@ -1688,6 +1785,20 @@ export class ImmersiveMode {
               }
             } else if (this.readRay(drag.source, frame, referenceSpace)) {
               this.grab.move(this.ray);
+              drag.started = true;
+            }
+            continue;
+          }
+
+          // Held body: the ray fixes the direction, the wrist supplies the travel. visionOS
+          // transient pointers are shoulder-anchored, so the ray origin barely moves when you
+          // pull your hand toward you — the wrist is what actually tracks the gesture.
+          if (drag.kind === 'body') {
+            if (this.readRay(drag.source, frame, referenceSpace)) {
+              const wrist = this.readWrist(drag.source, frame, referenceSpace, wristA)
+                ? wristA
+                : null;
+              this.bodyPointer?.moveGrab(this.ray, wrist);
               drag.started = true;
             }
             continue;

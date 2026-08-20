@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AVP sandbox — fire / sand / goo / water</title>
+    <title>AVP sandbox — Kora / MLS / AVBD</title>
     <style>
       :root {
         color-scheme: dark;
@@ -28,16 +28,33 @@
         left: 16px;
         bottom: 14px;
         pointer-events: none;
-        text-shadow: 0 1px 3px #000;
+        /* Backdrops run from a night sky to a white studio, so the plate carries the contrast
+           rather than a text shadow that only works against dark. */
+        background: rgba(0, 0, 0, 0.55);
+        padding: 6px 10px;
+        border-radius: 4px;
+        max-width: min(42ch, calc(100vw - 32px));
       }
       #hud .title { font-weight: 600; }
-      #hud .sub { color: var(--dim); font-size: 12px; }
+      #hud .sub {
+        color: var(--dim);
+        font-size: 12px;
+        margin-top: 2px;
+      }
+      #hud .sub a {
+        color: #c4b8a4;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+        pointer-events: auto;
+      }
+      #hud .sub a:hover { color: var(--accent); }
       #stats {
         font-variant-numeric: tabular-nums;
         color: var(--dim);
         font-size: 12px;
         margin-top: 4px;
       }
+      #stats[hidden] { display: none; }
 
       #toolbar {
         position: fixed;
@@ -45,10 +62,20 @@
         left: 50%;
         transform: translateX(-50%);
         display: flex;
+        flex-direction: column;
+        align-items: center;
         gap: 8px;
         z-index: 5;
       }
-      .mat-btn, #mat-reset, .nav {
+      #toolbar-modes, #toolbar-sub {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: center;
+        gap: 8px;
+      }
+      #toolbar-sub[hidden] { display: none; }
+      .mat-btn, #mat-reset, #mat-perf, .scene-select {
         padding: 8px 14px;
         border: 1px solid #4a4437;
         border-radius: 999px;
@@ -57,8 +84,33 @@
         font: inherit;
         cursor: pointer;
       }
-      .mat-btn:hover, #mat-reset:hover, .nav:hover { border-color: #7a6a4a; background: #241f18; }
-      .mat-btn.active { border-color: var(--accent); color: var(--accent); }
+      .scene-select {
+        border-radius: 10px;
+        max-width: min(92vw, 420px);
+        padding: 8px 12px;
+      }
+      .mat-btn:hover, #mat-reset:hover, #mat-perf:hover, .scene-select:hover {
+        border-color: #7a6a4a;
+        background: #241f18;
+      }
+      .mat-btn.active, #mat-perf.active { border-color: var(--accent); color: var(--accent); }
+      .sub-label { color: var(--dim); font-size: 12px; }
+      .mat-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        padding: 8px 14px;
+        border: 1px solid #4a4437;
+        border-radius: 999px;
+        background: #16151b;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+        user-select: none;
+      }
+      .mat-toggle:hover { border-color: #7a6a4a; background: #241f18; }
+      .mat-toggle[hidden] { display: none; }
+      .mat-toggle input { margin: 0; cursor: pointer; accent-color: var(--accent); }
 
       #xr-button {
         position: fixed;
@@ -98,21 +150,47 @@
     <div id="app"></div>
 
     <div id="toolbar">
-      <button class="mat-btn" id="mat-fire">Fire</button>
-      <button class="mat-btn" id="mat-sand">Sand</button>
-      <button class="mat-btn" id="mat-goo">Goo</button>
-      <button class="mat-btn" id="mat-water">Water</button>
-      <button class="mat-btn" id="mat-view" hidden title="Goo surface: gelatin isosurface vs bead impostors">Gel</button>
-      <button id="mat-reset">Reset</button>
-      <a class="nav" href="./cube.html">Cube</a>
+      <div id="toolbar-modes">
+        <button class="mat-btn" id="mat-kora" title="Kora combustion fire">Kora</button>
+        <button class="mat-btn" id="mat-mls" title="MLS-MPM sand / goo / water">MLS</button>
+        <button class="mat-btn" id="mat-avbd" title="WebGPU AVBD (webphysics)">AVBD</button>
+        <button class="mat-btn" id="mat-perf" title="Toggle performance readout">Perf</button>
+      </div>
+      <div id="toolbar-sub" hidden>
+        <span class="sub-label" id="sub-label">Scene</span>
+        <select class="scene-select" id="mls-scene" hidden title="MLS-MPM material">
+          <option value="sand">Sand</option>
+          <option value="goo">Goo</option>
+          <option value="water">Water</option>
+        </select>
+        <select class="scene-select" id="avbd-scene" hidden title="AVBD scene"></select>
+        <label
+          class="mat-toggle"
+          id="gel-toggle"
+          hidden
+          title="Raymarch the goo as one solid isosurface instead of drawing each particle"
+        >
+          <input type="checkbox" id="gel-solid" checked />
+          Solid
+        </label>
+        <button id="mat-reset">Reset</button>
+        <span class="sub-label">Backdrop</span>
+        <select class="scene-select" id="env-select" title="Background HDRI">
+          <option value="void">Void</option>
+          <option value="studio">Studio</option>
+          <option value="dusk">Dusk</option>
+          <option value="daylight">Daylight</option>
+          <option value="night">Night</option>
+        </select>
+      </div>
     </div>
 
     <button id="xr-button" hidden></button>
 
     <div id="hud">
-      <div class="title">AVP sandbox</div>
-      <div class="sub">Fire · sand · goo · water · desktop GUI + XR world params</div>
-      <div id="stats"></div>
+      <div class="title">Physics sandbox</div>
+      <div class="sub" id="hud-credit"></div>
+      <div id="stats" hidden></div>
     </div>
 
     <div id="unsupported">

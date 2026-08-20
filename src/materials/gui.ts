@@ -44,7 +44,6 @@ export function createMaterialsGui(
     'Active MPM exhibit. Fire is switched from the toolbar / XR strip.',
   );
   tip(gui.add(actions, 'reset').name('reset'), 'Re-seed particles for the active material.');
-
   tip(
     gui
       .add(params, 'gravity', 10, 250, 1)

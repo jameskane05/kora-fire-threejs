@@ -81,6 +81,7 @@ export class ForceColliders {
         strength: 0,
         radius: 0.08,
         isBox: false,
+        isCapsule: false,
         hx: 0.05,
         hy: 0.05,
         hz: 0.05,
@@ -200,9 +201,11 @@ export class ForceColliders {
 
       if (item.kind === 'sphere') {
         f.isBox = false;
+        f.isCapsule = false;
         f.radius = Math.max(0.02, (Math.abs(item.mesh.scale.x) * 0.5) / this.domain);
       } else {
         f.isBox = true;
+        f.isCapsule = false;
         _q.copy(item.mesh.quaternion);
         _ax.set(1, 0, 0).applyQuaternion(_q);
         _ay.set(0, 1, 0).applyQuaternion(_q);

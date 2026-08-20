@@ -3,9 +3,18 @@
  * Particle positions are packed each substep into `renderBuffer` for three.js to draw.
  */
 import shaderSource from './shaders/mpm3d.wgsl?raw';
+import audioStatsSource from './shaders/mpm_audio_stats.wgsl?raw';
 import { defaultMaterialsParams, materialTuning, type MaterialsParams } from './params';
 
 export type MaterialKind = 'goo' | 'sand' | 'water';
+
+/** Compact particle-velocity aggregates for procedural water audio. */
+export interface MotionStats {
+  meanSpeed: number;
+  maxSpeed: number;
+  highSpeedFraction: number;
+  samples: number;
+}
 
 const MAT_ID: Record<MaterialKind, number> = { goo: 0, sand: 1, water: 2 };
 
@@ -22,13 +31,15 @@ export interface ForcePoint {
   /** Push strength (negative gathers) */
   strength: number;
   /**
-   * Sphere radius when `isBox` is false.
-   * For boxes, unused (half-extents live in hx/hy/hz).
+   * Sphere / capsule radius.
+   * Unused for boxes (half-extents live in hx/hy/hz).
    */
   radius: number;
-  /** Oriented bone box (finger segments). Sphere when false. */
+  /** Oriented bone box (finger segments). Sphere when false (unless capsule). */
   isBox: boolean;
-  /** Box half-extents along ax / ay / az (sim units). */
+  /** Capsule along ax: half-length hx, radius `radius`. Takes priority over isBox. */
+  isCapsule: boolean;
+  /** Box half-extents along ax / ay / az (sim units). Capsule uses hx as half-length. */
   hx: number;
   hy: number;
   hz: number;
@@ -79,6 +90,10 @@ export class MlsMpm {
   }
 
   private device!: GPUDevice;
+  /** Exposed for perf benches that await queue drain. */
+  get gpuDevice(): GPUDevice {
+    return this.device;
+  }
   private particleBuffer!: GPUBuffer;
   private gridAcc!: GPUBuffer;
   private gridVel!: GPUBuffer;
@@ -100,6 +115,17 @@ export class MlsMpm {
   private bindGroupForce!: GPUBindGroup;
   private bindGroupIdle!: GPUBindGroup;
   private bindLayout!: GPUBindGroupLayout;
+
+  private audioStatsPipeline: GPUComputePipeline | null = null;
+  private audioStatsBindLayout: GPUBindGroupLayout | null = null;
+  private audioStatsParamsBuffer: GPUBuffer | null = null;
+  private audioStatsBuffer: GPUBuffer | null = null;
+  private audioStatsStaging: GPUBuffer | null = null;
+  private audioStatsBusy = false;
+  private readonly audioStatsParamsData = new ArrayBuffer(16);
+  private readonly audioStatsParamsU32 = new Uint32Array(this.audioStatsParamsData);
+  private readonly audioStatsParamsF32 = new Float32Array(this.audioStatsParamsData);
+  private readonly audioStatsZero = new Uint32Array(4);
 
   private readonly paramsData = new ArrayBuffer(PARAMS_SIZE);
   private readonly paramsF32 = new Float32Array(this.paramsData);
@@ -218,7 +244,102 @@ export class MlsMpm {
       entries: [{ binding: 0, resource: { buffer: this.paramsBufferIdle } }, ...shared],
     });
 
+    this.initAudioStats(device);
     this.reset(this.material);
+  }
+
+  private initAudioStats(device: GPUDevice): void {
+    const module = device.createShaderModule({ code: audioStatsSource, label: 'mpm-audio-stats' });
+    this.audioStatsBindLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+    this.audioStatsPipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.audioStatsBindLayout] }),
+      compute: { module, entryPoint: 'reduce_vel' },
+    });
+    this.audioStatsParamsBuffer = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'mpm-audio-stats-params',
+    });
+    this.audioStatsBuffer = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      label: 'mpm-audio-stats',
+    });
+    this.audioStatsStaging = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      label: 'mpm-audio-stats-staging',
+    });
+  }
+
+  /**
+   * Subsample `renderVelBuffer` into mean/max speed for the water audio bus.
+   * Safe to call while the sim keeps stepping; overlaps are ignored.
+   */
+  async readMotionStats(stride = 16): Promise<MotionStats | null> {
+    if (
+      !this.audioStatsPipeline ||
+      !this.audioStatsBindLayout ||
+      !this.audioStatsParamsBuffer ||
+      !this.audioStatsBuffer ||
+      !this.audioStatsStaging ||
+      this.audioStatsBusy
+    ) {
+      return null;
+    }
+    this.audioStatsBusy = true;
+    try {
+      const n = this.liveCount;
+      const step = Math.max(1, stride | 0);
+      this.audioStatsParamsU32[0] = n;
+      this.audioStatsParamsU32[1] = step;
+      this.audioStatsParamsF32[2] = 1.5;
+      this.audioStatsParamsF32[3] = 0;
+      this.device.queue.writeBuffer(this.audioStatsParamsBuffer, 0, this.audioStatsParamsData);
+      this.device.queue.writeBuffer(this.audioStatsBuffer, 0, this.audioStatsZero);
+
+      const bindGroup = this.device.createBindGroup({
+        layout: this.audioStatsBindLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.audioStatsParamsBuffer } },
+          { binding: 1, resource: { buffer: this.renderVelBuffer } },
+          { binding: 2, resource: { buffer: this.audioStatsBuffer } },
+        ],
+      });
+
+      const samples = Math.ceil(n / step);
+      const enc = this.device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(this.audioStatsPipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.ceil(samples / 64));
+      pass.end();
+      enc.copyBufferToBuffer(this.audioStatsBuffer, 0, this.audioStatsStaging, 0, 16);
+      this.device.queue.submit([enc.finish()]);
+
+      await this.audioStatsStaging.mapAsync(GPUMapMode.READ);
+      const u32 = new Uint32Array(this.audioStatsStaging.getMappedRange().slice(0));
+      this.audioStatsStaging.unmap();
+
+      const count = u32[2] || 0;
+      const sumSpeed = u32[0] / 1024;
+      const maxSpeed = new Float32Array(new Uint32Array([u32[1]]).buffer)[0] || 0;
+      const highCount = u32[3] || 0;
+      return {
+        meanSpeed: count > 0 ? sumSpeed / count : 0,
+        maxSpeed,
+        highSpeedFraction: count > 0 ? highCount / count : 0,
+        samples: count,
+      };
+    } finally {
+      this.audioStatsBusy = false;
+    }
   }
 
   dispose(): void {
@@ -229,6 +350,14 @@ export class MlsMpm {
     this.paramsBufferIdle?.destroy();
     this.renderBuffer?.destroy();
     this.renderVelBuffer?.destroy();
+    this.audioStatsParamsBuffer?.destroy();
+    this.audioStatsBuffer?.destroy();
+    this.audioStatsStaging?.destroy();
+    this.audioStatsParamsBuffer = null;
+    this.audioStatsBuffer = null;
+    this.audioStatsStaging = null;
+    this.audioStatsPipeline = null;
+    this.audioStatsBindLayout = null;
     this.resetScratch = null;
   }
 
@@ -493,7 +622,22 @@ export class MlsMpm {
       this.paramsF32[po + 2] = f?.z ?? 0;
       this.paramsF32[po + 3] = f?.strength ?? 0;
 
-      if (f?.isBox) {
+      if (f?.isCapsule) {
+        // Capsule along ax: halfLen in force_x.w, radius in force_y.w, force_z.w < 0 flags capsule.
+        const r = f.radius > 0 ? f.radius : f.hy;
+        this.paramsF32[xo] = f.ax;
+        this.paramsF32[xo + 1] = f.ay;
+        this.paramsF32[xo + 2] = f.az;
+        this.paramsF32[xo + 3] = f.hx;
+        this.paramsF32[yo] = f.bx;
+        this.paramsF32[yo + 1] = f.by;
+        this.paramsF32[yo + 2] = f.bz;
+        this.paramsF32[yo + 3] = r;
+        this.paramsF32[zo] = f.cx;
+        this.paramsF32[zo + 1] = f.cy;
+        this.paramsF32[zo + 2] = f.cz;
+        this.paramsF32[zo + 3] = -1;
+      } else if (f?.isBox) {
         this.paramsF32[xo] = f.ax;
         this.paramsF32[xo + 1] = f.ay;
         this.paramsF32[xo + 2] = f.az;

@@ -1,16 +1,16 @@
-# Kora fire in three.js
+# Kora physics sandbox
 
-A browser implementation of the combustion solver described in **[Kora: A Physics-Based Fire Pipeline and Toolset](https://doi.org/10.1145/3819990.3820026)** (Stomakhin et al., Weta FX, DigiPro '26) — the fire system built for *Avatar: Fire and Ash*, which won the VES 2026 Emerging Technology Award. Everything runs on the GPU through WebGPU compute shaders written in TSL.
+A browser physics sandbox in three.js, running entirely on the GPU through WebGPU compute shaders written in TSL. It began as an implementation of the Kora combustion solver and has grown into three exhibits sharing one renderer and one WebXR stack:
 
-**[Live demo](https://jameskane05.github.io/kora-fire-threejs/)** — needs a WebGPU browser.
+- **Fire** — the combustion solver from **[Kora: A Physics-Based Fire Pipeline and Toolset](https://doi.org/10.1145/3819990.3820026)** (Stomakhin et al., Weta FX, DigiPro '26), the fire system built for *Avatar: Fire and Ash*, which won the VES 2026 Emerging Technology Award. An Eulerian grid solver with real combustion chemistry.
+- **Materials** — sand, goo and water via **[MLS-MPM](https://doi.org/10.1145/3197517.3201293)** (Hu et al., SIGGRAPH 2018), a hybrid particle–grid method, with procedural water audio synthesized from simulation statistics.
+- **Rigid and soft bodies** — **[Augmented Vertex Block Descent](https://graphics.cs.utah.edu/research/projects/avbd/)** (Giles, Diaz, Yuksel, SIGGRAPH 2025) running as GPU compute: stacks, cloth, ropes, springs, ragdolls, dominoes and soft bodies, up to tens of thousands of bodies.
+
+**[Live demo](https://jameskane05.github.io/kora-fire-threejs/)** — needs a WebGPU browser. The fire is at the root; [`materials.html`](materials.html) is the sandbox with all three exhibits on a toolbar.
 
 ![Fire tornado preset](docs/fire-tornado.png)
 
-The paper's central argument is that fire behaviour should *emerge from tracked chemistry* rather than from noise and hand-keyed modulation:
-
-> Fuel-rich conditions give rise to oxygen starvation, in which combustion becomes locally oxygen-limited and flame fronts intermittently ignite and extinguish as fresh oxygen is entrained from the surrounding flow. This naturally produces visual phenomena known as choked flames, pulsation, and flickering. Because the solver tracks chemicals and models reactions explicitly, these behaviors emerge directly from the local availability of reactants rather than from heuristic noise or temporal modulation.
-
-So this carries real molar concentrations of fuel, oxygen, nitrogen and combustion products through every voxel, burns them against a stoichiometric limit, and lets the flicker fall out of the chemistry. With the propane torch preset the flame settles at 2200–2700 K, which is propane's adiabatic flame temperature — not a number that was dialled in anywhere.
+All three run on Apple Vision Pro in immersive VR, and in the MLS-MPM and AVBD exhibits your tracked hands are physics colliders — see [Immersive VR](#immersive-vr).
 
 ## Running it
 
@@ -25,13 +25,21 @@ The dev server is HTTPS on the LAN address as well as localhost, which is there 
 
 `npm run deploy` builds and force-pushes `dist` to the `gh-pages` branch. The build sets a `/kora-fire-threejs/` base path, since Pages serves a project repository from a subdirectory; the dev server stays at the root.
 
-Known issue: `npm run build` gates on `tsc --noEmit`, which currently runs for many minutes and gets killed rather than reporting an error. The editor's language service checks `src` clean, so this looks like pathological inference against the large `@types/three` graph under TypeScript 7's native compiler, not a real type error. `npx vite build` on its own works.
+Known issue: `npm run typecheck` runs for many minutes and gets killed rather than reporting an error, so the build deliberately doesn't gate on it. The editor's language service checks `src` clean, so this looks like pathological inference against the large `@types/three` graph under TypeScript 7's native compiler, not a real type error.
 
-## There are no particles
+## Fire (Kora)
+
+The paper's central argument is that fire behaviour should *emerge from tracked chemistry* rather than from noise and hand-keyed modulation:
+
+> Fuel-rich conditions give rise to oxygen starvation, in which combustion becomes locally oxygen-limited and flame fronts intermittently ignite and extinguish as fresh oxygen is entrained from the surrounding flow. This naturally produces visual phenomena known as choked flames, pulsation, and flickering. Because the solver tracks chemicals and models reactions explicitly, these behaviors emerge directly from the local availability of reactants rather than from heuristic noise or temporal modulation.
+
+So this carries real molar concentrations of fuel, oxygen, nitrogen and combustion products through every voxel, burns them against a stoichiometric limit, and lets the flicker fall out of the chemistry. With the propane torch preset the flame settles at 2200–2700 K, which is propane's adiabatic flame temperature — not a number that was dialled in anywhere.
+
+### There are no particles
 
 This is the thing most worth understanding, and it surprises people.
 
-There are two ways to simulate a fluid. The **Lagrangian** approach uses particles that carry properties like temperature and velocity and physically move through space. The **Eulerian** approach fixes a grid in space and lets fluid flow *through* stationary cells — nothing moves, and what changes is the numbers stored in each cell. Kora is Eulerian, and so is this. There is not one particle anywhere in the codebase.
+There are two ways to simulate a fluid. The **Lagrangian** approach uses particles that carry properties like temperature and velocity and physically move through space. The **Eulerian** approach fixes a grid in space and lets fluid flow *through* stationary cells — nothing moves, and what changes is the numbers stored in each cell. Kora is Eulerian, and so is this. There is not one particle anywhere in the fire solver. (The MLS-MPM exhibit is the counterpoint: it's a hybrid of both approaches, and the contrast between the two is half the point of putting them side by side.)
 
 The status readout says `96^3 · 0.88 M voxels`. That's a 96×96×96 lattice of 884,736 fixed cells filling a 2 m box, so each voxel is a cube roughly 2 cm on a side. That 2 cm is a hard floor on detail: no feature smaller than a voxel can exist. It's precisely why the paper's energy cascade turbulence is needed — it injects swirl to *suggest* structure below grid scale that the grid cannot itself resolve.
 
@@ -55,7 +63,7 @@ Each is double-buffered, because WebGPU won't let one compute shader read and wr
 
 Fire suits a grid because the physics is mostly spatial derivatives. Enforcing the ideal gas law means computing divergence; buoyancy means solving a pressure Poisson equation across neighbours; diffusion means averaging with adjacent cells. All natural on a lattice, all awkward with particles.
 
-## Paper sections mapped to code
+### Paper sections mapped to code
 
 The solver follows Algorithm 1 of the paper, one pass per step, orchestrated in [`KoraSolver.ts`](src/sim/KoraSolver.ts).
 
@@ -81,7 +89,7 @@ The solver follows Algorithm 1 of the paper, one pass per step, orchestrated in 
 
 Physical constants and the fuel database are in [`constants.ts`](src/sim/constants.ts). The controls are grouped the way the paper groups its toolset — sourcing, simulation control, art direction, rendering — because §5.2 argues the value is as much in *which* parameters get exposed as in the solver behind them.
 
-## Displacement volumes
+### Displacement volumes
 
 Not from the paper — Kora inherits collision objects from the host framework rather than describing them — but a fire that ignores the set isn't much use. One sphere is in the plume by default; add more from the *Displacement volumes* folder and drag them with the transform gizmo (`W` translate, `E` rotate, `R` scale, `Esc` deselect, click to pick). In a headset you pinch them directly — see [What a pinch does](#what-a-pinch-does).
 
@@ -98,13 +106,13 @@ The primitives are unrolled into the kernels at build time rather than looped ov
 
 Solid cells are decoupled whole rather than by sub-voxel fraction: a face counts as solid when either cell it separates is, which rounds the obstacle out to cell boundaries but leaves no half-buried cells still coupled through the pressure. They're also reset to still air each frame, since advection and diffusion aren't boundary-aware and would otherwise let heat seep in and glow inside the solid.
 
-## How this differs from production Kora
+### How this differs from production Kora
 
 Kora proper is "a weakly compressible, sparse, spatially adaptive, MPI-distributed physics-based combustion solver" running on a render farm. This is a dense grid in one browser tab, so the differences are substantial and worth being honest about.
 
 The grid here is dense and uniform rather than sparse and spatially adaptive, so memory is spent on empty air and resolution is uniform where Kora refines near the flame. There's no MPI distribution, no liquid-gas coupling or vaporization, and no Houdini integration. The pressure projection is a fixed number of Jacobi iterations rather than a converged solve, so it's formulated in terms of deviation from hydrostatic equilibrium to keep buoyancy correct regardless of convergence. Rendering is single-scattering raymarching rather than Manuka's spectral path tracing. The eq. (30) turbulence filter defaults to an à-trous approximation, with the exact form available as a toggle.
 
-## Performance
+### Performance
 
 The frame is almost entirely solver. On an M3 Air at 96³ the simulation is ~94% of it and the raymarcher under 3%, which is the opposite of what you might expect from a volume renderer and worth knowing before optimising the wrong thing.
 
@@ -132,13 +140,44 @@ Past that, cost is traded for quality through the `quality` control, which is de
 
 The tiers move grid resolution and Jacobi iterations first because that is where the measurement pointed; raymarch steps barely move until the lowest tier, since cutting them buys almost nothing here and costs banding. At `performance` the plume is visibly softer and loses its finest wisps, but it is still recognisably the same fire, and a 3 ms frame leaves room for a game to do everything else.
 
+### Diagnostics
+
+Field statistics can be read back from the GPU at any time, which is how the physics above was verified. In the browser console:
+
+```js
+await kora.probe()        // min/max/NaN per field, as a table
+kora.setDebugView('heat') // max-intensity projection of one channel
+kora.setQuality('balanced')
+await kora.advance(120)   // step without requestAnimationFrame, for headless checks
+kora.findBadPass()        // dispatch each pass alone, name any that fails to compile
+kora.gpuErrors()          // deduplicated WebGPU errors
+```
+
+The debug views step through the shading chain — `temperature`, `heat`, `soot`, `equivalence`, then `flameAlpha`, `blackbody`, `emission` — so a black frame can be attributed to a specific link rather than guessed at.
+
+![Domain grid, origin and simulation bounds](docs/domain-grid.png)
+
+## Materials (MLS-MPM)
+
+The **MLS** mode on the [`materials.html`](materials.html) toolbar is a 3D Moving Least Squares Material Point Method solver ([Hu et al. 2018](https://doi.org/10.1145/3197517.3201293)) — the hybrid counterpart to the fire's pure grid: particles carry mass and momentum, a background grid does the momentum exchange, and the constitutive model decides whether the same machinery behaves as **sand**, **goo** or **water**. The solver lives in [`MlsMpm.ts`](src/materials/MlsMpm.ts) with the grid transfer kernels in [`mpm3d.wgsl`](src/materials/shaders/mpm3d.wgsl); goo is rendered as a screen-space particle surface rather than raw points.
+
+Water gets sound. A compute pass reduces the particle velocity buffer into cheap motion aggregates, and a WebAudio graph drives a filtered-noise water bed plus Minnaert-resonance bubble plinks from those aggregates and the hand-collider forces — no sample banks involved. The design is written up in [`docs/procedural-water-audio.md`](docs/procedural-water-audio.md).
+
+In a headset, tracked hands become colliders in the material domain, so you can plough through sand or cup water. `?bench=1` (or `koraRunBench()`) times MLS goo against the AVBD gel-cut scene.
+
+## Rigid and soft bodies (AVBD)
+
+The **AVBD** mode is [Augmented Vertex Block Descent](https://graphics.cs.utah.edu/research/projects/avbd/) (Giles, Diaz, Yuksel, SIGGRAPH 2025) as a fully GPU-resident solver — broadphase, contact generation, constraint solve and integration are all WebGPU compute, vendored from Jure Triglav's MIT-licensed [webphysics](https://github.com/jure/webphysics) (see [`NOTICE.md`](src/materials/webphysics/NOTICE.md)) and adapted to this app's TSL stack. The broadphase is a GPU LBVH rebuilt every frame over a radix / OneSweep sort. Scenes cover stacks and pyramids, bridges, cloth on boxes, ropes, springs, Newton's cradles, dominoes, ragdolls, soft-body lattices (including a bunny), and coliseum stress tests up to 64k bodies.
+
+Desktop controls in the stack scenes follow webphysics: click to lock the pointer, WASD to fly, left mouse to shoot a box, R to reset. The **gel-cut** scene is the crossover exhibit — a soft gel the Kora hand colliders can slice — and keeps orbit controls. A CPU TypeScript port of Chris Giles' reference implementation ([`src/materials/avbd/`](src/materials/avbd)) is available behind `?avbdCpu=1`.
+
+In immersive mode the scenes are framed at hand scale, boxes can be grabbed and thrown with transient-pointer (gaze) selection, and tracked hand bones become swept kinematic colliders: each bone is fed into the solver with its finite-difference velocity rather than teleported per frame, so contacts see real hand motion — impulses, friction drag, and far less tunneling on fast swipes.
+
+Getting this running on Vision Pro uncovered a WebKit WGSL compiler bug: stores to a function-scope array inside a loop are lost when the loop body also contains two dynamic-bound inner loops and a nested `array<array<f32, 6>, 6>` — which is exactly the shape of an LDL factorization. The solver's 6×6 matrices are flattened to `array<f32, 36>` to work around it; a minimal reproduction and write-up live in [`docs/webkit-wgsl-bug/`](docs/webkit-wgsl-bug).
+
 ## Immersive VR
 
-There's an **Enter VR** button on headsets that can run it. On Apple Vision Pro (visionOS developer beta with the WebXR/WebGPU binding) the fire runs in the `performance` tier after the three.js pins below.
-
-### Materials lab
-
-[`materials.html`](materials.html) is a second exhibit on the same WebXR stack: 3D **MLS-MPM** (sand / goo / water) with mouse and hand force fields. Classical continuum solver first (Hu et al. MLS-MPM; Klár-style sand; neo-Hookean goo; weakly compressible water) — neural hybrid / subspace / SSFR water table are follow-ons, not blockers.
+There's an **Enter VR** button on headsets that can run it, for the fire and the materials sandbox both. On Apple Vision Pro (visionOS developer beta with the WebXR/WebGPU binding) the fire runs in the `performance` tier after the three.js pins below.
 
 ### Vision Pro + three.js WebGPU XR
 
@@ -191,29 +230,18 @@ Two details that aren't obvious:
 
 Two things are given up inside a session. Bloom is skipped, since the pass composites through a screen-space render target that the per-eye array texture won't take, so the fire loses its glow. And the quality tier is stepped down to `performance` for the duration and restored on exit: three currently disables multiview for WebGPU XR, so the volume is raymarched twice per frame at headset resolution, and a fire that judders is worse than one with less detail. Each tier also carries an `xrScale`, the fraction of the compositor's recommended eye resolution to actually render — the recommendation on a Vision Pro is 4851×3887 per eye, which is far more raymarching than the device can carry.
 
-## Diagnostics
-
-Field statistics can be read back from the GPU at any time, which is how the physics above was verified. In the browser console:
-
-```js
-await kora.probe()        // min/max/NaN per field, as a table
-kora.setDebugView('heat') // max-intensity projection of one channel
-kora.setQuality('balanced')
-await kora.advance(120)   // step without requestAnimationFrame, for headless checks
-kora.findBadPass()        // dispatch each pass alone, name any that fails to compile
-kora.gpuErrors()          // deduplicated WebGPU errors
-```
-
-The debug views step through the shading chain — `temperature`, `heat`, `soot`, `equivalence`, then `flameAlpha`, `blackbody`, `emission` — so a black frame can be attributed to a specific link rather than guessed at.
-
-![Domain grid, origin and simulation bounds](docs/domain-grid.png)
-
 ## Credits
 
-All of the science here is from the original paper. Please cite it, not this repository:
+The science is from the papers; please cite them, not this repository.
+
+Fire:
 
 > Alexey Stomakhin, John Edholm, Murali Ramachari, Aleksandr Isakov, Zahra Forootaninia, Marcus Schoo, Nicholas Illingworth, and Joe Letteri. 2026. *Kora: A Physics-Based Fire Pipeline and Toolset.* In Proceedings of DigiPro '26. https://doi.org/10.1145/3819990.3820026
 
 The paper is licensed CC BY-NC-ND 4.0. *Kora* is te reo Māori for *spark*.
+
+Materials: Yuanming Hu, Yu Fang, Ziheng Ge, Ziyin Qu, Yixin Zhu, Andre Pradhana, and Chenfanfu Jiang. 2018. *A Moving Least Squares Material Point Method with Displacement Discontinuity and Two-Way Rigid Body Coupling.* SIGGRAPH 2018. https://doi.org/10.1145/3197517.3201293
+
+Rigid bodies: Chris Giles, Elie Diaz, and Cem Yuksel. 2025. *Augmented Vertex Block Descent.* SIGGRAPH 2025. The GPU implementation is vendored from Jure Triglav's [webphysics](https://github.com/jure/webphysics) (MIT); the CPU port follows Chris Giles' [reference implementation](https://graphics.cs.utah.edu/research/projects/avbd/) (MIT); the GPU radix sort is based on Thomas Smith's GPUSorting (MIT). See the `NOTICE.md` files under [`src/materials/`](src/materials).
 
 The backdrops in `public/env/` are CC0 from [Poly Haven](https://polyhaven.com/). The hand mesh in `public/hands/` is the reference model from [`@webxr-input-profiles/assets`](https://github.com/immersive-web/webxr-input-profiles) (Apache-2.0).

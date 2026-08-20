@@ -1,6 +1,12 @@
 /**
  * Gelatin isosurface from MLS-MPM goo particles: splat density → smooth → raymarch.
  * Bead impostors remain available via GooViewMode.
+ *
+ * The march runs in the forward pass with no framebuffer read of any kind, so there is one
+ * shader path on every target. Screen-space refraction used to sample `viewportSharedTexture`,
+ * which forces the renderer to snapshot the framebuffer — fine on desktop, but it is a blit per
+ * eye on a headset and it is what made this too expensive to keep enabled. Transmission now
+ * arrives through ordinary alpha blending instead.
  */
 import {
   BackSide,
@@ -34,17 +40,12 @@ import {
   oneMinus,
   positionLocal,
   pow,
-  reflect,
-  refract,
-  screenUV,
   select,
   storage,
   uniform,
   vec3,
   vec4,
   viewZToPerspectiveDepth,
-  viewportSafeUV,
-  viewportSharedTexture,
 } from 'three/tsl';
 import densityShader from './shaders/gel_density.wgsl?raw';
 
@@ -56,8 +57,6 @@ type N = any;
 const PARAMS_SIZE = 16;
 /** Hard loop cap — keep modest for stereo XR compile/runtime cost. */
 const MAX_STEPS = 48;
-/** Gelatin-ish IOR (~1.33–1.5). Incident ray is object-space view direction. */
-const GEL_IOR = 1.42;
 
 export type GelQuality = 'desktop' | 'immersive';
 
@@ -95,10 +94,6 @@ export class GelSurface {
     boxMax: uniform(new Vector3()),
     threshold: uniform(0.42),
     steps: uniform(48),
-    /** 1 = XR path: no framebuffer fetch, no exit march, fewer steps. */
-    immersive: uniform(0),
-    /** Screen-space refraction strength. */
-    refractScale: uniform(0.12),
     /** Beer–Lambert absorption scale (higher = deeper green). */
     absorb: uniform(6.5),
   };
@@ -121,10 +116,25 @@ export class GelSurface {
 
     const at = (x: N, y: N, z: N) => dens.element(x.add(y.mul(nInt)).add(z.mul(nInt.mul(nInt))));
 
-    // Nearest — trilinear was ~8× denser fetches per march step and hurt XR entry hard.
+    // Trilinear. Nearest is one fetch instead of eight, but it puts the isosurface on cell walls:
+    // the silhouette staircases and the gradient normal snaps to axes, so the blob reads as voxels
+    // rather than jelly. Cell centres sit at (i + 0.5) / n — see splat_density.
+    const hiIdx = n.sub(1);
     const sample = (uvw: N): N => {
-      const c = uvw.clamp(float(0), float(0.9999)).mul(n);
-      return at(int(c.x), int(c.y), int(c.z));
+      const c = uvw.clamp(float(0), float(1)).mul(n).sub(0.5);
+      const b = vec3(c.x.floor(), c.y.floor(), c.z.floor());
+      const f = c.sub(b).clamp(0, 1);
+      const x0 = int(b.x.clamp(0, hiIdx));
+      const y0 = int(b.y.clamp(0, hiIdx));
+      const z0 = int(b.z.clamp(0, hiIdx));
+      const x1 = int(b.x.add(1).clamp(0, hiIdx));
+      const y1 = int(b.y.add(1).clamp(0, hiIdx));
+      const z1 = int(b.z.add(1).clamp(0, hiIdx));
+      const y0z0 = mix(at(x0, y0, z0), at(x1, y0, z0), f.x);
+      const y1z0 = mix(at(x0, y1, z0), at(x1, y1, z0), f.x);
+      const y0z1 = mix(at(x0, y0, z1), at(x1, y0, z1), f.x);
+      const y1z1 = mix(at(x0, y1, z1), at(x1, y1, z1), f.x);
+      return mix(mix(y0z0, y1z0, f.y), mix(y0z1, y1z1, f.y), f.z);
     };
 
     const material = new NodeMaterial();
@@ -159,20 +169,32 @@ export class GelSurface {
       const extent = this.u.boxMax.sub(this.u.boxMin);
       const t = start.add(ds.mul(0.5)).toVar();
       const hitT = float(-1).toVar();
+      const exitT = float(-1).toVar();
       const prevD = float(0).toVar();
       const prevT = start.toVar();
 
+      // One traversal picks up both crossings, so thickness for Beer–Lambert is free. The old
+      // split — march to the surface, then a second march for the exit — cost up to twice the
+      // steps and only ran on desktop; the headset path guessed thickness from view angle.
       Loop(MAX_STEPS, () => {
         If(t.greaterThanEqual(tFar).or(ds.lessThanEqual(0)), () => {
           Break();
         });
         const p = origin.add(dir.mul(t));
         const d = sample(p.sub(this.u.boxMin).div(extent));
-        If(d.greaterThanEqual(this.u.threshold), () => {
-          const denom = max(d.sub(prevD), float(1e-5));
-          const u = this.u.threshold.sub(prevD).div(denom).clamp(0, 1);
-          hitT.assign(mix(prevT, t, u));
-          Break();
+        If(hitT.lessThan(0), () => {
+          If(d.greaterThanEqual(this.u.threshold), () => {
+            const denom = max(d.sub(prevD), float(1e-5));
+            const u = this.u.threshold.sub(prevD).div(denom).clamp(0, 1);
+            hitT.assign(mix(prevT, t, u));
+          });
+        }).Else(() => {
+          If(d.lessThan(this.u.threshold), () => {
+            const denom = max(prevD.sub(d), float(1e-5));
+            const u = prevD.sub(this.u.threshold).div(denom).clamp(0, 1);
+            exitT.assign(mix(prevT, t, u));
+            Break();
+          });
         });
         prevD.assign(d);
         prevT.assign(t);
@@ -206,60 +228,15 @@ export class GelSurface {
       const ndv = max(Nrm.dot(V), float(0));
       const fresnel = pow(oneMinus(ndv), float(4.0)).mul(0.72).add(0.05);
 
-      // Thickness: full exit march on desktop; view-dependent estimate in XR (half the cost).
-      const thickness = mix(float(0.05), float(0.18), oneMinus(ndv)).toVar();
-      If(this.u.immersive.lessThan(0.5), () => {
-        const exitT = float(-1).toVar();
-        t.assign(hitT.add(ds));
-        prevD.assign(this.u.threshold);
-        prevT.assign(hitT);
-        Loop(MAX_STEPS, () => {
-          If(t.greaterThanEqual(tFar).or(ds.lessThanEqual(0)), () => {
-            Break();
-          });
-          const pExit = origin.add(dir.mul(t));
-          const dExit = sample(pExit.sub(this.u.boxMin).div(extent));
-          If(dExit.lessThan(this.u.threshold), () => {
-            const denom = max(prevD.sub(dExit), float(1e-5));
-            const u = prevD.sub(this.u.threshold).div(denom).clamp(0, 1);
-            exitT.assign(mix(prevT, t, u));
-            Break();
-          });
-          prevD.assign(dExit);
-          prevT.assign(t);
-          t.addAssign(ds);
-        });
-        If(exitT.greaterThan(hitT), () => {
-          thickness.assign(exitT.sub(hitT).clamp(0.01, 0.55));
-        });
-      });
-
-      // Screen-space refraction is expensive (and stall-prone) in stereo XR — skip the fetch.
-      const sceneSample = vec3(0.07, 0.08, 0.1).toVar();
-      If(this.u.immersive.lessThan(0.5), () => {
-        const eta = float(1).div(GEL_IOR);
-        const refrDir = refract(dir, Nrm, eta);
-        const useReflect = length(refrDir).lessThan(1e-4);
-        const bendDir = select(useReflect, reflect(dir, Nrm), normalize(refrDir));
-        const nView = normalize(modelViewMatrix.mul(vec4(Nrm, 0)).xyz);
-        const bendView = normalize(modelViewMatrix.mul(vec4(bendDir, 0)).xyz);
-        const distort = nView.xy
-          .mul(0.55)
-          .add(bendView.xy.mul(0.45))
-          .mul(this.u.refractScale.mul(thickness.mul(2.2).add(0.35)))
-          .mul(oneMinus(ndv).mul(0.65).add(0.35));
-        sceneSample.assign(viewportSharedTexture(viewportSafeUV(screenUV.add(distort))).rgb);
-      });
+      // No exit crossing means the blob runs to the far wall of the domain.
+      const thickness = select(exitT.greaterThan(hitT), exitT.sub(hitT), tFar.sub(hitT))
+        .clamp(0.01, 0.55);
 
       const sigma = vec3(0.55, 0.12, 0.4);
       const beer = exp(sigma.negate().mul(thickness.mul(this.u.absorb)));
       const tint = vec3(0.55, 0.95, 0.62);
       const gelBody = mix(vec3(0.05, 0.28, 0.14), vec3(0.16, 0.58, 0.32), ndv.mul(0.5).add(0.5));
-      const transmitted = select(
-        this.u.immersive.greaterThan(0.5),
-        gelBody.mul(beer).mul(tint),
-        sceneSample.mul(beer).mul(tint),
-      );
+      const transmitted = gelBody.mul(beer).mul(tint);
 
       const L = normalize(vec3(0.35, 0.85, 0.4));
       const H = normalize(L.add(V));
@@ -267,8 +244,10 @@ export class GelSurface {
       const rim = vec3(0.75, 0.98, 0.85).mul(fresnel.mul(0.4));
 
       const col = transmitted.mul(oneMinus(fresnel)).add(rim).add(vec3(spec));
-      // XR: true alpha so the floor shows through without a framebuffer read.
-      const alpha = select(this.u.immersive.greaterThan(0.5), mix(float(0.55), float(0.85), fresnel), float(1));
+      // Nothing behind the gel is ever sampled, so coverage has to carry the optical depth:
+      // a thin edge of jelly blends the scene through, a deep body and the grazing rim go solid.
+      const opticalDepth = oneMinus(exp(thickness.mul(this.u.absorb).negate()));
+      const alpha = mix(opticalDepth, float(1), fresnel).clamp(0.12, 1);
       return vec4(col, alpha);
     })();
 
@@ -345,11 +324,10 @@ export class GelSurface {
     this.u.threshold.value = t;
   }
 
+  /** Only the march resolution and density rebuild cost differ — the shader path is the same. */
   setQuality(quality: GelQuality): void {
     this.quality = quality;
-    const immersive = quality === 'immersive';
-    this.u.immersive.value = immersive ? 1 : 0;
-    this.u.steps.value = immersive ? 28 : 48;
+    this.u.steps.value = quality === 'immersive' ? 28 : 48;
   }
 
   update(renderer: WebGPURenderer, opts?: { splatRadius?: number; densityScale?: number; smoothPasses?: number }): void {

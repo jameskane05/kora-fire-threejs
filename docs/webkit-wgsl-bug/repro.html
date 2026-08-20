@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WGSL miscompile: stores to nested function-scope array lost in loop</title>
+</head>
+<body>
+<h1>WGSL: stores to nested function-scope array lost when outer loop contains two dynamic inner loops</h1>
+<p>
+A <code>@compute</code> shader writes <code>D[i]</code> once per iteration of a
+<code>for (i = 0; i &lt; 6; i++)</code> loop. When the loop body also contains two inner
+loops with data-dependent bounds (<code>j &lt; i</code>, <code>k &lt; i</code>) and a nested
+array (<code>array&lt;array&lt;f32, 6&gt;, 6&gt;</code>) is accessed, only the final
+iteration's store to <code>D</code> survives. Expected <code>D = [57600 x6]</code>;
+WebKit produces <code>D = [0, 0, 0, 0, 0, 57600]</code>.
+Chrome (Tint/Dawn) produces the correct result for the same shader.
+Flattening the nested array to <code>array&lt;f32, 36&gt;</code> avoids the bug.
+</p>
+<pre id="out">running...</pre>
+<script type="module">
+const wgsl = `
+@group(0) @binding(0) var<storage, read_write> outBuf : array<vec4f>;
+
+@compute @workgroup_size(1)
+fn main() {
+  var A: array<array<f32, 6>, 6>;
+  for (var r = 0u; r < 6u; r++) {
+    for (var c = 0u; c < 6u; c++) { A[r][c] = 0.0; }
+  }
+  for (var r = 0u; r < 6u; r++) { A[r][r] = 57600.0; }
+
+  var L: array<array<f32, 6>, 6>;
+  var D: array<f32, 6>;
+  for (var r = 0u; r < 6u; r++) {
+    D[r] = 0.0;
+    for (var c = 0u; c < 6u; c++) { L[r][c] = 0.0; }
+  }
+
+  var acc = 0.0;
+  for (var i = 0u; i < 6u; i++) {
+    // First dynamic inner loop: only reads the nested array.
+    for (var j = 0u; j < i; j++) {
+      acc += A[i][j];
+    }
+    var diag = A[i][i];
+    // Second dynamic inner loop.
+    for (var k = 0u; k < i; k++) {
+      diag -= L[i][k] * L[i][k] * D[k];
+    }
+    // BUG: only the i == 5 store takes effect in WebKit.
+    D[i] = max(diag, 1e-6);
+    L[i][i] = 1.0;
+  }
+
+  outBuf[0] = vec4f(D[0], D[1], D[2], D[3]);
+  outBuf[1] = vec4f(D[4], D[5], acc, 0.0);
+}
+`;
+
+const out = document.getElementById('out');
+try {
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) throw new Error('WebGPU unavailable');
+  const device = await adapter.requestDevice();
+  const module = device.createShaderModule({ code: wgsl });
+  const pipeline = await device.createComputePipelineAsync({
+    layout: 'auto',
+    compute: { module, entryPoint: 'main' },
+  });
+  const buf = device.createBuffer({
+    size: 32,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: buf } }],
+  });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  const readback = device.createBuffer({
+    size: 32,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  encoder.copyBufferToBuffer(buf, 0, readback, 0, 32);
+  device.queue.submit([encoder.finish()]);
+  await readback.mapAsync(GPUMapMode.READ);
+  const v = new Float32Array(readback.getMappedRange());
+  const D = Array.from(v.slice(0, 6));
+  const pass_ = D.every((d) => d === 57600);
+  out.textContent =
+    `D        = [${D.join(', ')}]\n` +
+    `expected = [57600, 57600, 57600, 57600, 57600, 57600]\n\n` +
+    (pass_ ? 'PASS' : 'FAIL: stores to D[] lost for all but the last loop iteration');
+} catch (e) {
+  out.textContent = `error: ${e.message}`;
+}
+</script>
+</body>
+</html>

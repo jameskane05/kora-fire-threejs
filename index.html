@@ -4,16 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Kora / AVP sandbox</title>
-    <meta http-equiv="refresh" content="0; url=./materials.html?exhibit=fire" />
     <script>
-      location.replace('./materials.html?exhibit=fire');
+      // Carry any query params (debug flags etc.) through the redirect, but do not invent one:
+      // with no ?exhibit the sandbox restores your last exhibit, falling back to sand.
+      location.replace('./materials.html' + location.search);
     </script>
+    <noscript>
+      <meta http-equiv="refresh" content="0; url=./materials.html" />
+    </noscript>
   </head>
   <body>
     <p>
       Redirecting to the
-      <a href="./materials.html?exhibit=fire">AVP sandbox</a>
-      (fire). Full fire tooling:
+      <a href="./materials.html">AVP sandbox</a>. Full fire tooling:
       <a href="./fire.html">fire.html</a>.
     </p>
   </body>

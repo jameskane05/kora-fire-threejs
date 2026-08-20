@@ -20,10 +20,11 @@ struct Params {
   _pad1: u32,
   // xyz = center in [0,1]^3, w = strength
   force_pos: array<vec4<f32>, 50>,
-  // Orthonormal box axes + half-extents. Sphere when force_y.w < 0 (radius = force_x.w).
+  // Orthonormal axes + extents. Sphere: force_y.w < 0 (radius = force_x.w).
+  // Capsule: force_z.w < 0 (halfLen = force_x.w, radius = force_y.w). Else oriented box.
   force_x: array<vec4<f32>, 50>, // xyz = axis X (bone length), w = halfLength / radius
-  force_y: array<vec4<f32>, 50>, // xyz = axis Y (width),     w = halfWidth  (<0 ⇒ sphere)
-  force_z: array<vec4<f32>, 50>, // xyz = axis Z (thickness), w = halfThick
+  force_y: array<vec4<f32>, 50>, // xyz = axis Y (width),     w = halfWidth / capsuleR (<0 ⇒ sphere)
+  force_z: array<vec4<f32>, 50>, // xyz = axis Z (thickness), w = halfThick (<0 ⇒ capsule)
 };
 
 // Packed particle. F and C are column-major 3×3 stored as three vec3 + pad each...
@@ -300,6 +301,12 @@ fn box_sdf(local: vec3<f32>, half: vec3<f32>) -> f32 {
   return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
 }
 
+// Capsule along local +X: segment [-half_len, +half_len], radius r.
+fn capsule_sdf(local: vec3<f32>, half_len: f32, r: f32) -> f32 {
+  let px = clamp(local.x, -half_len, half_len);
+  return length(local - vec3<f32>(px, 0.0, 0.0)) - r;
+}
+
 fn apply_forces(x: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
   // Strength is a once-per-frame velocity impulse (CPU only sends forces on substep 0).
   var out_v = v;
@@ -323,8 +330,29 @@ fn apply_forces(x: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
         weight = 1.0 - dist / r;
         push = normalize(d);
       }
+    } else if (az.w < 0.0) {
+      // Capsule along bone axis (fingertips).
+      let axis_x = ax.xyz;
+      let axis_y = ay.xyz;
+      let axis_z = az.xyz;
+      let half_len = max(ax.w, 1e-4);
+      let r = max(ay.w, 1e-4);
+      let local = vec3<f32>(dot(d, axis_x), dot(d, axis_y), dot(d, axis_z));
+      let sdf = capsule_sdf(local, half_len, r);
+      let shell = max(r * 0.85, 0.012);
+      if (sdf < shell) {
+        let e = 1e-3;
+        let gx = capsule_sdf(local + vec3<f32>(e, 0.0, 0.0), half_len, r) - capsule_sdf(local - vec3<f32>(e, 0.0, 0.0), half_len, r);
+        let gy = capsule_sdf(local + vec3<f32>(0.0, e, 0.0), half_len, r) - capsule_sdf(local - vec3<f32>(0.0, e, 0.0), half_len, r);
+        let gz = capsule_sdf(local + vec3<f32>(0.0, 0.0, e), half_len, r) - capsule_sdf(local - vec3<f32>(0.0, 0.0, e), half_len, r);
+        let grad_local = vec3<f32>(gx, gy, gz);
+        let grad_len = length(grad_local);
+        let n_local = select(vec3<f32>(1.0, 0.0, 0.0), grad_local / grad_len, grad_len > 1e-6);
+        push = normalize(axis_x * n_local.x + axis_y * n_local.y + axis_z * n_local.z);
+        weight = 1.0 - max(sdf, 0.0) / shell;
+      }
     } else {
-      // Oriented box (finger bones). Soft shell outside the surface.
+      // Oriented box (finger bones / palm). Soft shell outside the surface.
       let axis_x = ax.xyz;
       let axis_y = ay.xyz;
       let axis_z = az.xyz;

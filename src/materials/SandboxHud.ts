@@ -8,6 +8,10 @@ import type { KoraParams } from '../sim/params';
 import { MaterialPanel, type MaterialAction, type SandboxExhibit } from './MaterialPanel';
 import { WorldParamsPanel } from './WorldParamsPanel';
 import { FireParamsPanel } from './FireParamsPanel';
+import { AvbdScenePanel } from './AvbdScenePanel';
+import { EnvPanel } from './EnvPanel';
+import type { EnvironmentName } from '../scene/Environment';
+import type { StackPreset } from './webphysics/presets';
 import type { MaterialKind } from './MlsMpm';
 import type { MaterialsParams } from './params';
 
@@ -15,7 +19,9 @@ export class SandboxHud implements ActionPanel {
   readonly group = new Group();
   readonly materials: MaterialPanel;
   readonly params: WorldParamsPanel;
+  readonly env = new EnvPanel();
   private fireParams: FireParamsPanel | null = null;
+  private avbdScenes: AvbdScenePanel | null = null;
   private exhibit: SandboxExhibit;
   private paramsChangeHandler: (() => void) | null = null;
 
@@ -25,6 +31,7 @@ export class SandboxHud implements ActionPanel {
     this.params = new WorldParamsPanel(params);
     this.group.add(this.materials.group);
     this.group.add(this.params.group);
+    this.group.add(this.env.group);
     this.materials.setKind(exhibit);
     this.syncParamsVisibility();
   }
@@ -46,10 +53,28 @@ export class SandboxHud implements ActionPanel {
     this.syncParamsVisibility();
   }
 
+  /** GPU AVBD only — the CPU exhibit runs its own scene ids and has no desktop picker either. */
+  bindAvbdScenes(onSelect: (id: StackPreset) => void): void {
+    if (this.avbdScenes) {
+      this.group.remove(this.avbdScenes.group);
+      this.avbdScenes.dispose();
+    }
+    this.avbdScenes = new AvbdScenePanel();
+    this.avbdScenes.setOnSelect(onSelect);
+    this.group.add(this.avbdScenes.group);
+    this.syncParamsVisibility();
+  }
+
+  setAvbdScene(id: StackPreset): void {
+    this.avbdScenes?.setScene(id);
+  }
+
   get targets(): Object3D[] {
     const fire = this.fireParams?.visible ? this.fireParams.targets : [];
     const mpm = this.params.visible ? this.params.targets : [];
-    return [...this.materials.targets, ...mpm, ...fire];
+    const avbd = this.avbdScenes?.visible ? this.avbdScenes.targets : [];
+    const env = this.env.visible ? this.env.targets : [];
+    return [...this.materials.targets, ...mpm, ...fire, ...avbd, ...env];
   }
 
   get visible(): boolean {
@@ -66,6 +91,14 @@ export class SandboxHud implements ActionPanel {
     this.materials.setOnAction(handler);
   }
 
+  setOnEnvironment(handler: (name: EnvironmentName) => void): void {
+    this.env.setOnSelect(handler);
+  }
+
+  setEnvironment(name: EnvironmentName): void {
+    this.env.setEnvironment(name);
+  }
+
   setOnParamsChange(handler: () => void): void {
     this.paramsChangeHandler = handler;
     this.params.setOnChange(handler);
@@ -75,8 +108,12 @@ export class SandboxHud implements ActionPanel {
   setExhibit(exhibit: SandboxExhibit): void {
     this.exhibit = exhibit;
     this.materials.setKind(exhibit);
-    if (exhibit !== 'fire') this.params.setKind(exhibit);
+    if (exhibit !== 'fire' && exhibit !== 'avbd') this.params.setKind(exhibit);
     this.syncParamsVisibility();
+  }
+
+  setGelSurface(on: boolean): void {
+    this.materials.setGelSurface(on);
   }
 
   setMaterialKind(kind: MaterialKind): void {
@@ -90,6 +127,8 @@ export class SandboxHud implements ActionPanel {
     if (this.materials.handlePick(object)) return true;
     if (this.params.visible && this.params.handlePick(object)) return true;
     if (this.fireParams?.visible && this.fireParams.handlePick(object)) return true;
+    if (this.avbdScenes?.visible && this.avbdScenes.handlePick(object)) return true;
+    if (this.env.visible && this.env.handlePick(object)) return true;
     return false;
   }
 
@@ -101,13 +140,19 @@ export class SandboxHud implements ActionPanel {
   private syncParamsVisibility(): void {
     const show = this.group.visible;
     const fire = this.exhibit === 'fire';
-    this.params.setVisible(show && !fire);
+    const avbd = this.exhibit === 'avbd';
+    const mpm = !fire && !avbd;
+    this.env.setVisible(show);
+    this.params.setVisible(show && mpm);
     this.fireParams?.setVisible(show && fire);
+    this.avbdScenes?.setVisible(show && avbd);
   }
 
   dispose(): void {
     this.materials.dispose();
     this.params.dispose();
+    this.env.dispose();
     this.fireParams?.dispose();
+    this.avbdScenes?.dispose();
   }
 }
