@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AVP sandbox — Kora / MLS / AVBD</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --fg: #e8e2d9;
+        --dim: #8d8579;
+        --accent: #d4a574;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #07070a;
+        color: var(--fg);
+        font: 13px/1.5 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif;
+        overflow: hidden;
+      }
+      #app { position: fixed; inset: 0; }
+      canvas { display: block; width: 100%; height: 100%; }
+
+      #hud {
+        position: fixed;
+        left: 16px;
+        bottom: 14px;
+        pointer-events: none;
+        /* Backdrops run from a night sky to a white studio, so the plate carries the contrast
+           rather than a text shadow that only works against dark. */
+        background: rgba(0, 0, 0, 0.55);
+        padding: 6px 10px;
+        border-radius: 4px;
+        max-width: min(42ch, calc(100vw - 32px));
+      }
+      #hud .title { font-weight: 600; }
+      #hud .sub {
+        color: var(--dim);
+        font-size: 12px;
+        margin-top: 2px;
+      }
+      #hud .sub a {
+        color: #c4b8a4;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+        pointer-events: auto;
+      }
+      #hud .sub a:hover { color: var(--accent); }
+      #stats {
+        font-variant-numeric: tabular-nums;
+        color: var(--dim);
+        font-size: 12px;
+        margin-top: 4px;
+      }
+      #stats[hidden] { display: none; }
+
+      #toolbar {
+        position: fixed;
+        top: 14px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        z-index: 5;
+      }
+      #toolbar-modes, #toolbar-sub {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: center;
+        gap: 8px;
+      }
+      #toolbar-sub[hidden] { display: none; }
+      .mat-btn, #mat-reset, #mat-perf, .scene-select {
+        padding: 8px 14px;
+        border: 1px solid #4a4437;
+        border-radius: 999px;
+        background: #16151b;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+      }
+      .scene-select {
+        border-radius: 10px;
+        max-width: min(92vw, 420px);
+        padding: 8px 12px;
+      }
+      .mat-btn:hover, #mat-reset:hover, #mat-perf:hover, .scene-select:hover {
+        border-color: #7a6a4a;
+        background: #241f18;
+      }
+      .mat-btn.active, #mat-perf.active { border-color: var(--accent); color: var(--accent); }
+      .sub-label { color: var(--dim); font-size: 12px; }
+      .mat-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        padding: 8px 14px;
+        border: 1px solid #4a4437;
+        border-radius: 999px;
+        background: #16151b;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+        user-select: none;
+      }
+      .mat-toggle:hover { border-color: #7a6a4a; background: #241f18; }
+      .mat-toggle[hidden] { display: none; }
+      .mat-toggle input { margin: 0; cursor: pointer; accent-color: var(--accent); }
+
+      #xr-button {
+        position: fixed;
+        left: 50%;
+        bottom: 22px;
+        transform: translateX(-50%);
+        padding: 10px 22px;
+        border: 1px solid #4a4437;
+        border-radius: 999px;
+        background: #16151b;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+        z-index: 5;
+      }
+      #xr-button:hover:not(:disabled) { background: #241f18; border-color: #7a6a4a; }
+      #xr-button:disabled { color: var(--dim); cursor: default; opacity: 0.65; }
+      #xr-button[hidden] { display: none; }
+
+      #unsupported {
+        position: fixed;
+        inset: 0;
+        display: none;
+        place-items: center;
+        padding: 40px;
+        background: #07070a;
+        z-index: 10;
+      }
+      #unsupported.show { display: grid; }
+      #unsupported div { max-width: 44ch; text-align: center; }
+      #unsupported h1 { font-size: 18px; margin: 0 0 10px; }
+      #unsupported p { color: var(--dim); margin: 0; }
+      a { color: #ffab5e; }
+    </style>
+    <script type="module" crossorigin src="/kora-fire-threejs/assets/materials-CSnmjgnG.js"></script>
+    <link rel="modulepreload" crossorigin href="/kora-fire-threejs/assets/three.webgpu-B9ZdZD-M.js">
+    <link rel="modulepreload" crossorigin href="/kora-fire-threejs/assets/lil-gui.esm-BsdZdNnU.js">
+    <link rel="modulepreload" crossorigin href="/kora-fire-threejs/assets/platform-TEiS3og3.js">
+    <link rel="modulepreload" crossorigin href="/kora-fire-threejs/assets/modulepreload-polyfill-Dezn_h7o.js">
+    <link rel="modulepreload" crossorigin href="/kora-fire-threejs/assets/solver-D9IA81Pz.js">
+  </head>
+  <body>
+    <div id="app"></div>
+
+    <div id="toolbar">
+      <div id="toolbar-modes">
+        <button class="mat-btn" id="mat-kora" title="Kora combustion fire">Kora</button>
+        <button class="mat-btn" id="mat-mls" title="MLS-MPM sand / goo / water">MLS</button>
+        <button class="mat-btn" id="mat-avbd" title="WebGPU AVBD (webphysics)">AVBD</button>
+        <button class="mat-btn" id="mat-perf" title="Toggle performance readout">Perf</button>
+      </div>
+      <div id="toolbar-sub" hidden>
+        <span class="sub-label" id="sub-label">Scene</span>
+        <select class="scene-select" id="mls-scene" hidden title="MLS-MPM material">
+          <option value="sand">Sand</option>
+          <option value="goo">Goo</option>
+          <option value="water">Water</option>
+        </select>
+        <select class="scene-select" id="avbd-scene" hidden title="AVBD scene"></select>
+        <label
+          class="mat-toggle"
+          id="gel-toggle"
+          hidden
+          title="Raymarch the goo as one solid isosurface instead of drawing each particle"
+        >
+          <input type="checkbox" id="gel-solid" checked />
+          Solid
+        </label>
+        <button id="mat-reset">Reset</button>
+        <span class="sub-label">Backdrop</span>
+        <select class="scene-select" id="env-select" title="Background HDRI">
+          <option value="void">Void</option>
+          <option value="studio">Studio</option>
+          <option value="dusk">Dusk</option>
+          <option value="daylight">Daylight</option>
+          <option value="night">Night</option>
+        </select>
+      </div>
+    </div>
+
+    <button id="xr-button" hidden></button>
+
+    <div id="hud">
+      <div class="title">Physics sandbox</div>
+      <div class="sub" id="hud-credit"></div>
+      <div id="stats" hidden></div>
+    </div>
+
+    <div id="unsupported">
+      <div>
+        <h1>WebGPU is not available</h1>
+        <p>
+          This sandbox runs combustion and MLS-MPM in WebGPU compute shaders. Try Chrome/Edge 113+,
+          or Safari 18+ / visionOS with WebGPU.
+        </p>
+      </div>
+    </div>
+
+  </body>
+</html>
